@@ -13,7 +13,7 @@ members = [
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
-repository = "https://github.com/ser163/TencentDB-Agent-Memory" # 待定：NSMT 独立仓库后更新
+repository = "https://github.com/ser163/nsmt"
 
 [workspace.dependencies]
 serde = { version = "1", features = ["derive"] }
