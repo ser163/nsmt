@@ -5,6 +5,7 @@
 //! - 锁：租约锁（内存 + TTL），崩溃可恢复（M2 先用内存）
 
 use nsmt_core::messages::{FileTree, FileTreeEntry};
+use nsmt_fs::ObjectStore as _;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -23,18 +24,16 @@ fn now_ms() -> u64 {
 #[derive(Clone)]
 pub struct ServerFs {
     root: PathBuf,
+    objects: nsmt_fs::LocalObjectStore,
 }
 
 impl ServerFs {
     pub fn new(base: &Path, user_domain: &str) -> Self {
-        Self {
-            root: base.join("server").join(sanitize(user_domain)),
-        }
+        let root = base.join("server").join(sanitize(user_domain));
+        let objects = nsmt_fs::LocalObjectStore::new(root.join("objects"));
+        Self { root, objects }
     }
 
-    fn objects_dir(&self) -> PathBuf {
-        self.root.join("objects")
-    }
     fn trees_dir(&self) -> PathBuf {
         self.root.join("trees")
     }
@@ -42,23 +41,17 @@ impl ServerFs {
         self.trees_dir().join("latest.json")
     }
 
-    /// 存一个对象（已存在则跳过，幂等）。
+    /// 存一个对象（委托对象存储抽象；决策 #10 可换 S3 后端）。
     pub fn put_object(&self, blob_id: &str, bytes: &[u8]) -> std::io::Result<()> {
-        let dir = self.objects_dir();
-        std::fs::create_dir_all(&dir)?;
-        let p = dir.join(blob_id);
-        if p.exists() {
-            return Ok(());
-        }
-        std::fs::write(p, bytes)
+        self.objects.put(blob_id, bytes)
     }
 
     pub fn get_object(&self, blob_id: &str) -> Option<Vec<u8>> {
-        std::fs::read(self.objects_dir().join(blob_id)).ok()
+        self.objects.get(blob_id)
     }
 
     pub fn object_exists(&self, blob_id: &str) -> bool {
-        self.objects_dir().join(blob_id).exists()
+        self.objects.exists(blob_id)
     }
 
     /// 保存目录树（最新树 + 按 tree_hash 存档）。

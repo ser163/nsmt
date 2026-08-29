@@ -36,6 +36,9 @@ pub struct Ticket {
 pub struct Register {
     pub machine_id: String,
     pub agent_tag: String,
+    /// 机器公钥（hex，Ed25519）。
+    pub machine_pubkey: String,
+    /// 对 `machine_id + "\n" + agent_tag` 的机器签名（hex）。
     pub machine_signature: String,
 }
 

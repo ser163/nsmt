@@ -5,6 +5,7 @@ mod memory;
 mod registry;
 mod session;
 mod state;
+mod tenants;
 
 use anyhow::Context;
 use std::net::SocketAddr;
@@ -21,12 +22,21 @@ async fn main() -> anyhow::Result<()> {
 
     // rustls 双 provider 存在时需显式选择（quinn 拉 aws-lc-rs + ring）
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    // `ygg admin add-tenant <domain> <pubkey>`：预注册租户域公钥
+        if args2(1).as_deref() == Some("admin") || args2(2).as_deref() == Some("admin") {
+        let cmd = args2(2);
+        if cmd.as_deref() == Some("add-tenant") {
+            let domain = args2(3).expect("domain");
+            let pubkey = args2(4).expect("domain pubkey");
+            let store = tenants::TenantStore::load().await;
+            store.upsert_tenant(&domain, &pubkey).await?;
+            println!("tenant added: {domain}");
+            return Ok(());
+        }
+    }
 
-    let bind: SocketAddr = std::env::args()
-        .nth(1)
-        .unwrap_or_else(|| "0.0.0.0:5555".into())
-        .parse()
-        .context("usage: ygg [bind_addr]")?;
+
+    let bind: SocketAddr = bind_arg();
 
     let (cert_der, key_der) = tls::self_signed("localhost")?;
     persist_cert(&cert_der)?;
@@ -42,6 +52,7 @@ async fn main() -> anyhow::Result<()> {
         quinn::Endpoint::server(server_config, bind).context("bind quinn endpoint")?;
 
     let state = Arc::new(state::ServerState::new());
+    let tenants = Arc::new(tenants::TenantStore::load().await);
     tokio::spawn(state.registry.clone().prune_loop());
     tokio::spawn(state.locks.clone().cleanup_loop());
 
@@ -49,10 +60,11 @@ async fn main() -> anyhow::Result<()> {
 
     while let Some(conn) = endpoint.accept().await {
         let state = state.clone();
+        let tenants = tenants.clone();
         tokio::spawn(async move {
             match conn.await {
                 Ok(c) => {
-                    if let Err(e) = session::handle(c, state).await {
+                    if let Err(e) = session::handle(c, state, tenants.clone()).await {
                         tracing::debug!("session ended: {e}");
                     }
                 }
@@ -90,4 +102,17 @@ mod tls {
         let key_der = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key.serialize_der()));
         Ok((cert_der, key_der))
     }
+}
+
+/// 读取命令行参数（index 从 0 开始）。
+fn args2(i: usize) -> Option<String> {
+    std::env::args().nth(i)
+}
+
+fn bind_arg() -> SocketAddr {
+    std::env::args()
+        .nth(1)
+        .map(|s| s.parse())
+        .unwrap_or_else(|| "0.0.0.0:5555".parse())
+        .unwrap_or_else(|_| "0.0.0.0:5555".parse().unwrap())
 }

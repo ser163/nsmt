@@ -5,6 +5,7 @@
 
 use crate::fs::{tree_hash, ServerFs};
 use crate::state::ServerState;
+use crate::tenants::TenantStore;
 use nsmt_core::frame::{Frame, FrameType};
 use nsmt_core::messages::{
     Auth, FileDiff, FileDiffResult, FileGet, FilePut, FileTree, Hello, HelloAck, LockAcquire,
@@ -28,7 +29,7 @@ fn nonce() -> String {
     format!("nsmt-nonce-{}-{}", now_ms(), generate_machine_id().0)
 }
 
-pub async fn handle(conn: quinn::Connection, state: Arc<ServerState>) -> anyhow::Result<()> {
+pub async fn handle(conn: quinn::Connection, state: Arc<ServerState>, tenants: Arc<TenantStore>) -> anyhow::Result<()> {
     let (send, recv) = conn.accept_bi().await?;
     let mut fs = FrameStream::new(recv, send);
 
@@ -40,16 +41,30 @@ pub async fn handle(conn: quinn::Connection, state: Arc<ServerState>) -> anyhow:
     let hello: Hello = frame.payload_json()?;
     tracing::info!("HELLO from {:?} (client={})", hello.user_domain, hello.client);
 
-    fs.send_json(FrameType::HelloAck, 0, &HelloAck { nonce: nonce(), tenant_exists: true })
+    let auth_nonce = nonce();
+    fs.send_json(FrameType::HelloAck, 0, &HelloAck { nonce: auth_nonce.clone(), tenant_exists: true })
         .await?;
 
-    // ── AUTH（M0/M1 不强校验）──
+    // ── AUTH（Ed25519 验签）──
     let frame = fs.recv().await?.ok_or_else(|| anyhow::anyhow!("eof before auth"))?;
-    let _auth: Auth = frame.payload_json()?;
+    let auth: Auth = frame.payload_json()?;
+    if let Err(e) = tenants.verify_auth(&hello.user_domain, &auth_nonce, &auth.nonce_signature).await {
+        tracing::warn!("AUTH failed for {}: {e}", hello.user_domain);
+        send_error(&mut fs, "0xE002", &format!("auth_failed: {e}"), None).await?;
+        return Ok(());
+    }
 
-    // ── REGISTER ──
+    // ── REGISTER（机器签名校验）──
     let frame = fs.recv().await?.ok_or_else(|| anyhow::anyhow!("eof before register"))?;
     let reg: Register = frame.payload_json()?;
+    if let Err(e) = tenants
+        .verify_register(&hello.user_domain, &reg.machine_id, &reg.agent_tag, &reg.machine_pubkey, &reg.machine_signature)
+        .await
+    {
+        tracing::warn!("REGISTER failed for {}: {e}", reg.machine_id);
+        send_error(&mut fs, "0xE004", &format!("register_failed: {e}"), None).await?;
+        return Ok(());
+    }
 
     let user_domain = hello.user_domain.clone();
     let info = MachineInfo {
@@ -229,5 +244,24 @@ pub async fn handle(conn: quinn::Connection, state: Arc<ServerState>) -> anyhow:
         )
         .await;
 
+    Ok(())
+}
+
+
+async fn send_error<R, W>(fs: &mut FrameStream<R, W>, code: &str, message: &str, request_id: Option<String>) -> anyhow::Result<()>
+where
+    R: tokio::io::AsyncRead + Unpin,
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    fs.send_json(
+        FrameType::Error,
+        0,
+        &nsmt_core::messages::ErrorMsg {
+            code: code.into(),
+            message: message.into(),
+            request_id,
+        },
+    )
+    .await?;
     Ok(())
 }

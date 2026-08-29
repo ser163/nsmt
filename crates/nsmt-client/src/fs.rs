@@ -66,12 +66,16 @@ fn walk(root: &Path, dir: &Path, out: &mut Vec<FileTreeEntry>) -> std::io::Resul
         if ft.is_dir() {
             walk(root, &p, out)?;
         } else if ft.is_file() {
-            let bytes = std::fs::read(&p)?;
             let rel = p
                 .strip_prefix(root)
                 .unwrap_or(&p)
                 .to_string_lossy()
                 .replace('\\', "/");
+            // 冲突副本 / 本地缓存标记 不参与同步
+            if rel.starts_with(".sync-conflict-") || rel.starts_with(".nsmt-") {
+                continue;
+            }
+            let bytes = std::fs::read(&p)?;
             let meta = std::fs::metadata(&p)?;
             out.push(FileTreeEntry {
                 path: rel,
@@ -121,6 +125,34 @@ pub fn materialize(entry: &FileTreeEntry, bytes: &[u8]) -> std::io::Result<()> {
         f.write_all(bytes)?;
     }
     Ok(())
+}
+
+/// 物化时处理冲突：本地已有且内容不同 → 保留冲突副本（.sync-conflict），再写入远端版。
+pub fn materialize_with_conflict(entry: &FileTreeEntry, bytes: &[u8], requester: &str) -> std::io::Result<()> {
+    let dir = share_dir();
+    let target = dir.join(&entry.path);
+    if target.exists() {
+        if let Ok(local_bytes) = std::fs::read(&target) {
+            if object_id(&local_bytes) != entry.blob_id {
+                let ts = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis())
+                    .unwrap_or(0);
+                let conflict = target.with_file_name(format!(
+                    ".sync-conflict-{}-{}-{ts}",
+                    sanitize_name(requester),
+                    entry.path.replace('/', "_")
+                ));
+                let _ = std::fs::copy(&target, &conflict);
+                tracing::warn!("conflict: local {} differs -> kept {}", entry.path, conflict.display());
+            }
+        }
+    }
+    materialize(entry, bytes)
+}
+
+fn sanitize_name(s: &str) -> String {
+    s.chars().map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' }).collect()
 }
 
 /// 计算两树差异中"需要拉取"的对象。

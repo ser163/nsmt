@@ -12,6 +12,7 @@ sha2.workspace = true
 hex.workspace = true
 thiserror.workspace = true
 ed25519-dalek.workspace = true
+rand_core.workspace = true
 machine-uid.workspace = true
 hostname.workspace = true
 tokio.workspace = true

@@ -12,6 +12,7 @@ mod fs;
 mod memory;
 
 use anyhow::Context;
+use nsmt_core::crypto::{load_or_create_domain_key, load_or_create_machine_key, KeyPair};
 use nsmt_core::frame::FrameType;
 use notify::Watcher as _;
 use nsmt_core::identity::{generate_machine_id, AgentTag};
@@ -46,6 +47,9 @@ async fn main() -> anyhow::Result<()> {
     let (hw_machine, _) = generate_machine_id();
     let machine_id = std::env::var("NSMT_MACHINE_ID").unwrap_or_else(|_| hw_machine.to_string());
 
+    let domain_key = load_or_create_domain_key()?;
+    let machine_key = load_or_create_machine_key()?;
+
     let fallback = memory::LocalFallback::from_env();
     let fqn = format!("{user_domain}/{machine_id}/{agent}");
 
@@ -55,7 +59,7 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!("QUIC connected to {server_addr}");
     let (send, recv) = conn.open_bi().await?;
     let mut fs = FrameStream::new(recv, send);
-    handshake(&mut fs, &user_domain, &agent, &machine_id).await?;
+    handshake(&mut fs, &user_domain, &agent, &machine_id, &domain_key, &machine_key).await?;
 
     match command {
         Some("capture") => {
@@ -97,7 +101,14 @@ async fn connect(addr: SocketAddr) -> anyhow::Result<quinn::Connection> {
     Ok(endpoint.connect_with(client_config, addr, "localhost").context("connect")?.await.context("handshake")?)
 }
 
-async fn handshake<R, W>(fs: &mut FrameStream<R, W>, domain: &str, agent: &str, machine: &str) -> anyhow::Result<()>
+async fn handshake<R, W>(
+    fs: &mut FrameStream<R, W>,
+    domain: &str,
+    agent: &str,
+    machine: &str,
+    domain_key: &KeyPair,
+    machine_key: &KeyPair,
+) -> anyhow::Result<()>
 where
     R: tokio::io::AsyncRead + Unpin,
     W: tokio::io::AsyncWrite + Unpin,
@@ -107,15 +118,21 @@ where
         protocol_version: nsmt_core::frame::PROTOCOL_VERSION,
         client: format!("yggd/{}", env!("CARGO_PKG_VERSION")),
     }).await?;
-    let _ack: HelloAck = fs.recv().await?.ok_or_else(|| anyhow::anyhow!("eof"))?.payload_json()?;
+    let ack: HelloAck = fs.recv().await?.ok_or_else(|| anyhow::anyhow!("eof"))?.payload_json()?;
+    // AUTH：用域密钥签 nonce
+    let nonce_sig = domain_key.sign(ack.nonce.as_bytes());
     fs.send_json(FrameType::Auth, 0, &Auth {
         user_domain: domain.into(),
-        nonce_signature: "M0-placeholder".into(),
+        nonce_signature: nonce_sig,
     }).await?;
+    // REGISTER：机器签名
+    let msg = format!("{machine}\n{agent}");
+    let machine_sig = machine_key.sign(msg.as_bytes());
     fs.send_json(FrameType::Register, 0, &Register {
         machine_id: machine.into(),
         agent_tag: agent.into(),
-        machine_signature: "M0-placeholder".into(),
+        machine_pubkey: machine_key.public_hex(),
+        machine_signature: machine_sig,
     }).await?;
     let ack: RegisterAck = fs.recv().await?.ok_or_else(|| anyhow::anyhow!("eof"))?.payload_json()?;
     tracing::info!("registered {machine} online={}", ack.machines.len());
@@ -251,7 +268,7 @@ where
                             for p in &diff.changed {
                                 if let Some(e) = remote_tree.entries.iter().find(|e| &e.path == p) {
                                     if let Some(bytes) = fs::get_object(fs, &e.blob_id).await? {
-                                        fs::materialize(e, &bytes)?;
+                                        fs::materialize_with_conflict(e, &bytes, fqn)?;
                                         fs::ensure_object_local(&e.blob_id, &bytes)?;
                                     }
                                 }

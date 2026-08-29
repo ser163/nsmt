@@ -8,6 +8,7 @@ description = "NSMT 服务器 ygg：relay + registry + 锁 + 记忆/文件服务
 [dependencies]
 nsmt-core = { path = "../nsmt-core" }
 nsmt-memory = { path = "../nsmt-memory" }
+nsmt-fs = { path = "../nsmt-fs" }
 sha2.workspace = true
 hex.workspace = true
 tokio.workspace = true
