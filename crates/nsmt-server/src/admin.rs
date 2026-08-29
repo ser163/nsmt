@@ -62,6 +62,14 @@ pub async fn spawn(
         .route("/api/users/register", post(register_user))
         .route("/api/users/login", post(login_user))
         .route("/api/tenants/key", post(set_tenant_key))
+        // M8：会员/配额 UI
+        .route("/api/users", get(list_users))
+        .route("/api/users/{username}/upgrade", post(upgrade_user))
+        // M7：重启信号
+        .route("/api/admin/restart", post(admin_restart))
+        // 待办池：租户备份/恢复
+        .route("/api/backup", get(backup_tenant))
+        .route("/api/restore", post(restore_tenant))
         .with_state(app_state);
 
     let listener = tokio::net::TcpListener::bind(bind).await?;
@@ -210,5 +218,211 @@ async fn set_tenant_key(State(s): State<AdminState>, Json(b): Json<SetKeyReq>) -
     match s.tenants.upsert_tenant(&b.domain, &b.pubkey).await {
         Ok(()) => Json(json!({"ok": true, "domain": b.domain})),
         Err(e) => Json(json!({"error": e.to_string()})),
+    }
+}
+
+
+// ── M8：会员 / 配额 UI ──
+
+/// `GET /api/users`：用户列表 + plan + 用量 + 配额（配额 UI 数据源）。
+async fn list_users(State(s): State<AdminState>, headers: axum::http::HeaderMap) -> Json<Value> {
+    if !authorized(&s, headers.get("x-admin-token").and_then(|v| v.to_str().ok())) {
+        return Json(json!({"error": "unauthorized"}));
+    }
+    let Some(db) = &s.state.db else {
+        return Json(json!({"error": "user db not enabled"}));
+    };
+    let usage = s.state.usage_bytes.read().await.clone();
+    match db.list_users().await {
+        Ok(users) => {
+            let list: Vec<Value> = users
+                .iter()
+                .map(|(u, plan, created)| {
+                    let quota = crate::db::UserDb::quota_for_plan(plan);
+                    json!({
+                        "username": u,
+                        "plan": plan,
+                        "quota_bytes": quota,
+                        "usage_bytes": usage.get(u).copied().unwrap_or(0),
+                        "created_at": created,
+                    })
+                })
+                .collect();
+            Json(json!({"users": list}))
+        }
+        Err(e) => Json(json!({"error": e})),
+    }
+}
+
+#[derive(Deserialize)]
+struct UpgradeReq { plan: String }
+
+/// `POST /api/users/{username}/upgrade`：会员升级（admin 操作，预留计费接口）。
+async fn upgrade_user(
+    State(s): State<AdminState>,
+    headers: axum::http::HeaderMap,
+    axum::extract::Path(username): axum::extract::Path<String>,
+    Json(b): Json<UpgradeReq>,
+) -> Json<Value> {
+    if !authorized(&s, headers.get("x-admin-token").and_then(|v| v.to_str().ok())) {
+        return Json(json!({"error": "unauthorized"}));
+    }
+    let Some(db) = &s.state.db else {
+        return Json(json!({"error": "user db not enabled"}));
+    };
+    match db.set_plan(&username, &b.plan).await {
+        Ok(plan) => Json(json!({"ok": true, "username": username, "plan": plan, "quota_bytes": crate::db::UserDb::quota_for_plan(&plan)})),
+        Err(e) => Json(json!({"error": e})),
+    }
+}
+
+
+// ── M7：ygg-admin 需要的重启信号（进程重启由监督器执行）──
+
+/// `POST /api/admin/restart`：请求优雅重启。返回后以退出码 3 退出，
+/// 由 ygg-admin 监督器捕获并拉起新进程（M7.1）。
+async fn admin_restart(State(s): State<AdminState>, headers: axum::http::HeaderMap) -> Json<Value> {
+    if !authorized(&s, headers.get("x-admin-token").and_then(|v| v.to_str().ok())) {
+        return Json(json!({"error": "unauthorized"}));
+    }
+    let pid = std::process::id();
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        tracing::info!("admin restart requested; exiting with code 3");
+        std::process::exit(3); // 监督器约定：3 = 请求重启
+    });
+    Json(json!({"ok": true, "restarting": true, "pid": pid}))
+}
+
+
+// ── 待办池：租户备份 / 恢复 ──
+
+/// `GET /api/backup?domain=<d>`：把租户数据（trees/objects/tenants）打包到
+/// `NSMT_HOME/backups/<domain>-<ts>.tar`，返回路径与条目数（仅本地后端可用）。
+async fn backup_tenant(
+    State(s): State<AdminState>,
+    headers: axum::http::HeaderMap,
+    axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> Json<Value> {
+    if !authorized(&s, headers.get("x-admin-token").and_then(|v| v.to_str().ok())) {
+        return Json(json!({"error": "unauthorized"}));
+    }
+    let Some(domain) = q.get("domain") else {
+        return Json(json!({"error": "missing domain"}));
+    };
+    let nsmt_home = nsmt_home_path();
+    let src = nsmt_home.join("server").join(sanitize(domain));
+    if !src.exists() {
+        return Json(json!({"error": format!("tenant dir not found: {}", src.display())}));
+    }
+    let backups = nsmt_home.join("backups");
+    let _ = std::fs::create_dir_all(&backups);
+    let ts = crate::registry::now_ms();
+    let out = backups.join(format!("{domain}-{ts}.tar"));
+    let count = tar_dir(&src, &out);
+    Json(json!({
+        "ok": count >= 0,
+        "domain": domain,
+        "archive": out.display().to_string(),
+        "entries": count.max(0),
+    }))
+}
+
+/// `POST /api/restore {archive, domain}`：从备份 tar 恢复租户数据。
+#[derive(Deserialize)]
+struct RestoreReq { archive: String, domain: String }
+
+async fn restore_tenant(
+    State(s): State<AdminState>,
+    headers: axum::http::HeaderMap,
+    Json(b): Json<RestoreReq>,
+) -> Json<Value> {
+    if !authorized(&s, headers.get("x-admin-token").and_then(|v| v.to_str().ok())) {
+        return Json(json!({"error": "unauthorized"}));
+    }
+    let archive = std::path::PathBuf::from(&b.archive);
+    if !archive.exists() {
+        return Json(json!({"error": format!("archive not found: {}", archive.display())}));
+    }
+    let nsmt_home = nsmt_home_path();
+    let dst = nsmt_home.join("server").join(sanitize(&b.domain));
+    let count = untar_dir(&archive, &dst);
+    Json(json!({"ok": count >= 0, "domain": b.domain, "restored_entries": count.max(0)}))
+}
+
+fn nsmt_home_path() -> std::path::PathBuf {
+    std::env::var("NSMT_HOME")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| {
+            std::env::var("HOME")
+                .map(|h| std::path::PathBuf::from(h).join(".nsmt"))
+                .unwrap_or_else(|_| std::path::PathBuf::from(".nsmt"))
+        })
+}
+
+fn sanitize(s: &str) -> String {
+    s.chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        .collect()
+}
+
+/// 简单 tar 打包（无外部依赖）：复制目录为扁平 tar（path + size + data）。
+fn tar_dir(src: &std::path::Path, out: &std::path::Path) -> i64 {
+    let mut count = 0i64;
+    let mut buf = Vec::new();
+    let mut files = Vec::new();
+    collect_files(src, src, &mut files);
+    for (rel, path) in &files {
+        let Ok(data) = std::fs::read(path) else { continue };
+        let rel_bytes = rel.as_bytes();
+        buf.extend_from_slice(&(rel_bytes.len() as u32).to_le_bytes());
+        buf.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        buf.extend_from_slice(rel_bytes);
+        buf.extend_from_slice(&data);
+        count += 1;
+    }
+    match std::fs::write(out, &buf) {
+        Ok(()) => count,
+        Err(_) => -1,
+    }
+}
+
+/// 解包 tar（tar_dir 的逆操作）。
+fn untar_dir(archive: &std::path::Path, dst: &std::path::Path) -> i64 {
+    let Ok(buf) = std::fs::read(archive) else { return -1 };
+    let _ = std::fs::create_dir_all(dst);
+    let mut i = 0usize;
+    let mut count = 0i64;
+    while i + 8 <= buf.len() {
+        let rel_len = u32::from_le_bytes([buf[i], buf[i + 1], buf[i + 2], buf[i + 3]]) as usize;
+        let data_len = u32::from_le_bytes([buf[i + 4], buf[i + 5], buf[i + 6], buf[i + 7]]) as usize;
+        i += 8;
+        if i + rel_len + data_len > buf.len() {
+            break;
+        }
+        let rel = String::from_utf8_lossy(&buf[i..i + rel_len]).into_owned();
+        let data = &buf[i + rel_len..i + rel_len + data_len];
+        let target = dst.join(rel);
+        if let Some(parent) = target.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if std::fs::write(&target, data).is_ok() {
+            count += 1;
+        }
+        i += rel_len + data_len;
+    }
+    count
+}
+
+fn collect_files(root: &std::path::Path, dir: &std::path::Path, out: &mut Vec<(String, std::path::PathBuf)>) {
+    if let Ok(rd) = std::fs::read_dir(dir) {
+        for e in rd.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                collect_files(root, &p, out);
+            } else if let Ok(rel) = p.strip_prefix(root) {
+                out.push((rel.to_string_lossy().into_owned(), p));
+            }
+        }
     }
 }

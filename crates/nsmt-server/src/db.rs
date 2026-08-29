@@ -182,6 +182,41 @@ impl UserDb {
         }
     }
 
+    /// 会员升级（M8）：设置用户 plan。合法值 free/pro。
+    pub async fn set_plan(&self, username: &str, plan: &str) -> Result<String, String> {
+        if plan != "free" && plan != "pro" {
+            return Err(format!("unknown plan: {plan}"));
+        }
+        let n = sqlx::query("UPDATE users SET plan = ? WHERE username = ?")
+            .bind(plan)
+            .bind(username)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| format!("db: {e}"))?
+            .rows_affected();
+        if n == 0 {
+            return Err("用户不存在".into());
+        }
+        Ok(plan.into())
+    }
+
+    /// 用户列表（控制 API / 会员管理用）。
+    pub async fn list_users(&self) -> Result<Vec<(String, String, u64)>, String> {
+        // (username, plan, created_at)
+        let rows = sqlx::query("SELECT username, plan, created_at FROM users ORDER BY created_at")
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| format!("db: {e}"))?;
+        let mut out = Vec::new();
+        for r in rows {
+            let username: String = r.try_get("username").map_err(|e| e.to_string())?;
+            let plan: String = r.try_get("plan").map_err(|e| e.to_string())?;
+            let created: i64 = r.try_get("created_at").map_err(|e| e.to_string())?;
+            out.push((username, plan, created.max(0) as u64));
+        }
+        Ok(out)
+    }
+
     async fn issue_token(&self, username: &str) -> String {
         use sha2::{Digest, Sha256};
         let token = format!(
