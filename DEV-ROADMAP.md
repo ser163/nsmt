@@ -12,7 +12,15 @@
 - **Monitoring**: live process status (PID, uptime, CPU/mem), online machines & agents, active connections, per-tenant usage (storage / bandwidth / memory count).
 - **Logs**: browse `ygg` logs (stdout/stderr) with filters + level; follow (tail).
 - **Auth**: admin login (password / token), separate from user-facing API.
-- **Stack (建议)**: Rust backend serving a static SPA (or lightweight template); embed the admin server in `ygg` (e.g., `--admin 127.0.0.1:8090`), or a separate `ygg-admin` binary.
+- **Design decision (2026-08-30)**: **two processes** — a separate `ygg-admin` supervisor + a **control API** inside `ygg`. A process cannot cleanly restart/observe itself, so the admin must be out-of-process to survive crashes and restart the server.
+  ```
+  ygg-admin (Web UI + supervisor, :8090)
+     ├── spawn / restart / kill ygg          (process management)
+     ├── monitor health / CPU / mem / logs   (tail log files)
+     └── HTTP control API 127.0.0.1:8091 → ygg (status/tenants/quotas/online/locks/usage)
+  ```
+- **`ygg` control API** (`--control 127.0.0.1:8091`): read-only status + admin ops + log stream.
+- **Fallback**: on systemd/launchd deploys, OS may supervise restarts; `ygg-admin` still handles management + monitoring + UI.
 - **API sketch**:
   ```
   GET  /api/status                 # server health + uptime
