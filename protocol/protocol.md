@@ -244,6 +244,7 @@ yggd                                    ygg
 - 客户端同时写本地托底；
 - **离线**：客户端只写本地，条目进 `t/<user_domain>/queue/<machine_id>`，重连后补写池；
 - **幂等**：`observed_at + content_hash` 去重，重复 capture 不产生重复向量条目。
+- **固定记忆约定（M6.4）**：客户端首启把共享目录位置写入一条系统 note，`user_content` = `[nsmt:share_dir] 共享目录: <abs path>`、`assistant_content` = `(system)`、`scope` = `user`；同时写本地托底并落 marker `~/.nsmt/share.path`（写一次即不再重复，离线首启重试），任何 agent `recall` 共享目录均可定位。
 
 ### 6.4 待同步队列（离线补写）
 

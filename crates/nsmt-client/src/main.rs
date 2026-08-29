@@ -17,8 +17,8 @@ use nsmt_core::frame::FrameType;
 use notify::Watcher as _;
 use nsmt_core::identity::{generate_machine_id, AgentTag};
 use nsmt_core::messages::{
-    Auth, FileGet, FileTree, Heartbeat, Hello, HelloAck, MachineInfo, MemoryCapture, MemoryRecall,
-    OnlineDelta, OnlineList, Register, RegisterAck,
+    Auth, FileGet, FileTree, Heartbeat, Hello, HelloAck, MachineInfo, MemoryCapture,
+    MemoryCaptureResult, MemoryRecall, OnlineDelta, OnlineList, Register, RegisterAck,
 };
 use nsmt_core::frame::{Frame, FrameType as FT};
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerifier};
@@ -68,6 +68,16 @@ async fn main() -> anyhow::Result<()> {
     let mut fs = FrameStream::new(recv, send);
     let peer_addr = start_peer_listener().await?;
     handshake(&mut fs, &user_domain, &agent, &machine_id, &peer_addr, &domain_key, &machine_key).await?;
+
+    // M6.4 固定记忆：首启把共享目录写入共享记忆（域池，note key=nsmt:share_dir）+ 本地托底（双写），
+    // 只执行一次（marker ~/.nsmt/share.path）；失败不阻塞主流程，下次运行重试。
+    {
+        let share_dir = fs::share_dir();
+        let _ = std::fs::create_dir_all(&share_dir);
+        if let Err(e) = write_share_dir_note(&mut fs, &fallback, &fqn, &share_dir).await {
+            tracing::warn!("M6.4 share dir note failed: {e:#}");
+        }
+    }
 
     match command {
         Some("capture") => {
@@ -618,5 +628,87 @@ async fn conflicts_cli(args: &[String]) -> anyhow::Result<()> {
         }
         return Ok(());
     }
+    Ok(())
+}
+
+
+/// M6.4 固定记忆：首次运行时把共享目录绝对路径写入**共享记忆**（域池，经服务器
+/// MEMORY_CAPTURE，note key=`nsmt:share_dir`）+ 本地托底（双写），确保任何 agent
+/// 都能 recall 到共享目录位置。marker（`~/.nsmt/share.path`）落盘即"已记录"，
+/// 仅当服务器链路打通（收到 MemoryCaptureResult）才落盘，保证离线首启可重试。
+async fn write_share_dir_note<R, W>(
+    fs: &mut FrameStream<R, W>,
+    fallback: &memory::LocalFallback,
+    fqn: &str,
+    dir: &std::path::Path,
+) -> anyhow::Result<()>
+where
+    R: tokio::io::AsyncRead + Unpin,
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    let marker = std::env::var("NSMT_HOME")
+        .map(|h| std::path::PathBuf::from(h).join("share.path"))
+        .unwrap_or_else(|_| {
+            std::env::var("HOME")
+                .map(|h| std::path::PathBuf::from(h).join(".nsmt/share.path"))
+                .unwrap_or_else(|_| std::path::PathBuf::from(".nsmt/share.path"))
+        });
+    if marker.exists() {
+        return Ok(()); // 已记录，首启一次
+    }
+    let abs = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
+    let note = format!("[nsmt:share_dir] 共享目录: {}", abs.display());
+    let request_id = format!("note-{}", now_ms());
+
+    // ① 共享记忆（域池主路径）：经服务器 MEMORY_CAPTURE 双写
+    fs.send_json(
+        FrameType::MemoryCapture,
+        0,
+        &MemoryCapture {
+            request_id: request_id.clone(),
+            user_content: note.clone(),
+            assistant_content: "(system)".into(),
+            scope: "user".into(),
+            fqn: fqn.into(),
+            observed_at: now_ms(),
+        },
+    )
+    .await?;
+    // 等本请求的 CaptureResult（跳过在线广播帧）
+    let result = loop {
+        let resp = fs
+            .recv()
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("eof while waiting MemoryCaptureResult"))?;
+        match resp.frame_type {
+            FrameType::MemoryCaptureResult => {
+                let r: MemoryCaptureResult = resp.payload_json()?;
+                if r.request_id == request_id {
+                    break r;
+                }
+            }
+            FrameType::OnlineDelta => {
+                let d: OnlineDelta = resp.payload_json()?;
+                tracing::debug!("[online-delta] {:?} {}", d.kind, d.machine.machine_id);
+            }
+            FrameType::OnlineList => {
+                let m: OnlineList = resp.payload_json()?;
+                print_online(&m.machines);
+            }
+            _ => {}
+        }
+    };
+    tracing::info!("share dir note committed to pool: {}", result.committed);
+
+    // ② 本地托底（双写之备）
+    match fallback.capture_local(&note, "(system)", "nsmt:system").await {
+        Ok(()) => tracing::info!("share dir note written to local fallback"),
+        Err(e) => tracing::warn!("share dir note local write failed: {e}"),
+    }
+
+    // ③ 服务器链路已打通 → 落 marker，之后不再重复写
+    let _ = std::fs::create_dir_all(marker.parent().unwrap_or(std::path::Path::new(".")));
+    let _ = std::fs::write(&marker, abs.display().to_string());
+    tracing::info!("share dir noted (nsmt:share_dir): {}", abs.display());
     Ok(())
 }

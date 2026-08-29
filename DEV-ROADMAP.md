@@ -99,7 +99,7 @@
 
 ## 7. Task Breakdown & Milestones (任务清单)
 
-### M6 — ygg Control API + User System (进行中 ✅ in progress)
+### M6 — ygg Control API + User System (已完成 ✅)
 
 - [x] **M6.1 ygg 控制 API ✅**（`ygg --control 127.0.0.1:8091`，axum 内嵌 HTTP，2026-08-30 实测通过）：
   - [x] `GET /api/status` 服务器健康/uptime/pid/配额/用量
@@ -109,7 +109,7 @@
   - [x] 控制 API 鉴权（NSMT_ADMIN_TOKEN / x-admin-token）
 - [x] **M6.2 用户系统 ✅**：**通用 SQL 驱动 sqlx Any（SQLite/MySQL/PostgreSQL，`NSMT_DB_URL` 换库即用）**；`users/sessions` 表；注册→登录→自动建租户（domain=username）；argon2 密码；`POST /api/users/register|login`、`POST /api/tenants/key`
 - [x] **M6.3 配额按用户 ✅**：`users.plan`（free=50MB / pro=1GiB）→ `ServerState.quota_for(domain)`；注册响应返回 quota_bytes=52428800；无用户库时回退全局 env
-- [ ] **M6.4 固定记忆**：客户端首次运行把共享目录写入共享记忆（note, key=`nsmt:share_dir`）
+- [x] **M6.4 固定记忆 ✅**（2026-08-30 实测通过）：客户端首启把共享目录绝对路径写入**共享记忆**（经服务器 MEMORY_CAPTURE，域池 note，key=`nsmt:share_dir`）+ 本地托底（双写）+ marker `~/.nsmt/share.path`（落盘后不再重复写，离线首启可重试）；任何 agent `recall` 共享目录都能拿到路径
 
 ### M7 — ygg-admin (独立监督器 + Web UI) (planned)
 
