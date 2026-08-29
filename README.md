@@ -1,33 +1,30 @@
 # NSMT / Yggdrasil — Net Share Memory Tree
 
-> English primary · 中文为辅
 > A multi-tenant, multi-machine, multi-agent **shared memory + shared file** network layer.
-> 一个多租户、多机器、多 agent 的「共享记忆 + 共享文件」网络层。
+> 中文版见 [README.zh-CN.md](README.zh-CN.md)
 
 NSMT (codename **Yggdrasil**, the Norse world-tree) lets agents (Maka / Hermes / custom) running on
 different machines join one **user domain** to share one memory tree and one set of shared files —
 with identity, locking, resume, P2P, encryption, quotas and a web admin console.
 
-不同机器上的 agent（Maka / Hermes / 自定义）在同一用户域下共享记忆树与共享文件，支持身份鉴权、文件锁、断点续传、P2P 直连、端到端加密、配额与 Web 管理后台。
+---
+
+## Features
+
+| Milestone | Feature |
+|---|---|
+| M0–M2 | Identity (FQN/Ed25519) · QUIC transport · online registry · memory dual-write/fallback · shared file CAS/tree/lock |
+| M3–M4 | Auth hardening · conflict handling · ObjectStore abstraction · resume · S3 backend · P2P mesh · conflict CLI |
+| M5 | MinIO S3 live · per-tenant quota · E2E encryption · interactive conflict merge |
+| M6 | Control API (`--control :8091`) · user system (sqlx Any: SQLite/MySQL/PG + argon2) · per-user quota (free=50MB / pro=1GiB) · fixed memory (`nsmt:share_dir` note) |
+| M7 | `ygg-admin` supervisor (spawn/restart/kill ygg, crash auto-restart) + Web UI (:8090) + control-API aggregation |
+| M8 | Membership (`users.plan` free/pro) · quota UI (usage bar + upgrade CTA) · billing hooks reserved |
+| M9 | P2P peer auth + NAT hole punch · conflict Web GUI (`conflicts-web`) · S3 tenant prefix · E2E key rotation / per-tenant keys · domain pool sharding |
+| Backlog | Admin process restart · tenant backup/restore (control API) |
 
 ---
 
-## Features (特性)
-
-| Milestone | Feature | 说明 |
-|---|---|---|
-| M0–M2 | Identity (FQN/Ed25519) · QUIC transport · online registry · memory dual-write/fallback · shared file CAS/tree/lock | 身份/传输/在线/记忆/文件 基础 |
-| M3–M4 | Auth hardening · conflict handling · ObjectStore abstraction · resume · S3 backend · P2P mesh · conflict CLI | 加固/断点续传/S3/P2P/冲突 CLI |
-| M5 | MinIO S3 live · per-tenant quota · E2E encryption · interactive conflict merge | 生产化（S3 实机/配额/E2E/交互合并） |
-| M6 | **Control API** (`--control :8091`) · **user system** (sqlx Any: SQLite/MySQL/PG + argon2) · per-user quota (free=50MB / pro=1GiB) · **fixed memory** (`nsmt:share_dir` note) | 控制 API/用户系统/配额/固定记忆 |
-| M7 | **`ygg-admin`** supervisor (spawn/restart/kill ygg, crash auto-restart) + **Web UI** (:8090) + control-API aggregation | 独立监督器 + Web 管理后台 |
-| M8 | **Membership** (`users.plan` free/pro) · quota UI (usage bar + upgrade CTA) · billing hooks reserved | 会员/配额 UI |
-| M9 | **P2P peer auth + NAT hole punch** · **conflict Web GUI** (`conflicts-web`) · **S3 tenant prefix** · **E2E key rotation / per-tenant keys** · **domain pool sharding** | P2P 认证打洞/冲突 Web 合并/S3 多租户/E2E 轮换/域池分片 |
-| Backlog | Admin process restart · tenant **backup/restore** (control API) | 进程重启/租户备份恢复 |
-
----
-
-## Architecture (总体架构)
+## Architecture
 
 ```
                        User Domain "ser163"
@@ -59,7 +56,7 @@ with identity, locking, resume, P2P, encryption, quotas and a web admin console.
 └──────────────────────────────────────────────────────────────┘
 ```
 
-## Components (组件)
+## Components
 
 | Binary | Crate | Role | Ports |
 |---|---|---|---|
@@ -72,9 +69,9 @@ with identity, locking, resume, P2P, encryption, quotas and a web admin console.
 
 ---
 
-## Quick Start (快速开始)
+## Quick Start
 
-### Build (构建)
+### Build
 
 ```bash
 cargo build --release
@@ -83,7 +80,7 @@ cargo build --release
 # target/release/nsmt-admin  -> ygg-admin
 ```
 
-### Run (运行)
+### Run
 
 ```bash
 # 1) (optional) Tencent memory gateway
@@ -110,7 +107,7 @@ NSMT_USER_DOMAIN=ser163 NSMT_MACHINE_ID=bbbb1111aaaa0000 \
 ./target/release/nsmt-client 127.0.0.1:5555 conflicts-web 8088   # http://127.0.0.1:8088
 ```
 
-### Memory (记忆)
+### Memory
 
 ```bash
 # capture = dual-write (domain pool + local fallback); recall = network-first, timeout → local
@@ -118,7 +115,7 @@ yggd 127.0.0.1:5555 capture "user said" "assistant replied"
 yggd 127.0.0.1:5555 recall "question"
 ```
 
-### Conflicts (冲突合并)
+### Conflicts
 
 ```bash
 yggd 127.0.0.1:5555 conflicts                          # list
@@ -128,29 +125,27 @@ yggd 127.0.0.1:5555 conflicts-web                      # Web GUI at :8088
 
 ---
 
-## Documentation (文档索引)
+## Documentation
 
 | Doc | Content |
 |---|---|
-| `docs/项目策划.md` | Original requirements & design decisions (需求/决策记录) |
-| `ARCHITECTURE.md` | Architecture overview (架构总览) |
-| `protocol/protocol.md` | **Wire protocol spec — single source of truth** (协议规范，最重要) |
-| `DEV-ROADMAP.md` | Development roadmap M6–M9 + backlog (开发规划) |
-| `deploy/` | Deployment guide: server / client / overview (部署指南) |
+| `docs/项目策划.md` | Original requirements & design decisions |
+| `ARCHITECTURE.md` | Architecture overview |
+| `protocol/protocol.md` | **Wire protocol spec — single source of truth** |
+| `DEV-ROADMAP.md` | Development roadmap M6–M9 + backlog |
+| `deploy/` | Deployment guide: server / client / overview |
 
-## Testing (测试)
+## Testing
 
 ```bash
 cargo test        # unit + integration tests across all crates
 ```
 
-## Status (状态)
+## Status
 
 All milestones **M0–M9** and the **backlog** are implemented ✅ (2026-08-30), with end-to-end
 verification on macOS (dual-machine file sync + E2E, P2P peer fetch, admin restart, backup/restore,
 membership upgrade). See `DEV-ROADMAP.md`.
-
-所有里程碑 **M0–M9** 与待办池均已完成 ✅（2026-08-30），并在 macOS 上端到端实测通过（双机文件同步 + E2E、P2P 直连拉取、后台重启、备份/恢复、会员升级）。
 
 ## License
 
