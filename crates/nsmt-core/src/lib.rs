@@ -8,6 +8,7 @@
 //! 对应文档：`protocol/protocol.md`（本项目最重要文档）。
 
 pub mod crypto;
+pub mod e2e;
 pub mod error;
 pub mod frame;
 pub mod identity;

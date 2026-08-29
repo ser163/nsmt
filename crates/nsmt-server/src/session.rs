@@ -204,8 +204,13 @@ pub async fn handle(conn: quinn::Connection, state: Arc<ServerState>, tenants: A
                                             Vec::new()
                                         };
                                         let mut payload = (idx as u32).to_le_bytes().to_vec();
-                                        payload.extend_from_slice(&chunk);
-                                        let c = Frame::new(FrameType::FileChunk, 0, payload);
+                                        let cipher = nsmt_core::e2e::e2e_key_from_env();
+                                        let enc = nsmt_core::e2e::encrypt_payload(cipher.as_ref(), &chunk, idx)?;
+                                        payload.extend_from_slice(&enc);
+                                        let mut c = Frame::new(FrameType::FileChunk, 0, payload);
+                                        if cipher.is_some() {
+                                            c.flags = nsmt_core::frame::Flags(0x01);
+                                        }
                                         fs.send(&c).await?;
                                     }
                                     None => {
@@ -226,6 +231,13 @@ pub async fn handle(conn: quinn::Connection, state: Arc<ServerState>, tenants: A
                             }
                             FrameType::FilePut => {
                                 let fp: FilePut = frame.payload_json()?;
+                                // 多租户配额：预占（超限拒绝）
+                                if !state.try_reserve_quota(&user_domain, fp.size).await {
+                                    tracing::warn!("quota exceeded for tenant {user_domain} (size={})", fp.size);
+                                    let e = nsmt_core::messages::ErrorMsg { code: "0xE040".into(), message: "quota_exceeded".into(), request_id: None };
+                                    fs.send_json(FrameType::Error, 0, &e).await?;
+                                    continue;
+                                }
                                 let temp_path = server_fs.temp_path_for(&fp.blob_id);
                                 let _ = std::fs::remove_file(&temp_path);
                                 pending_upload = Some(PendingUpload {
@@ -330,16 +342,17 @@ async fn handle_chunk(
         return Ok(());
     }
     let idx = u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]) as u64;
-    let data = &payload[4..];
     if idx >= pu.total_chunks || pu.received[idx as usize] {
         return Ok(());
     }
+    let cipher = nsmt_core::e2e::e2e_key_from_env();
+    let data = nsmt_core::e2e::decrypt_payload(cipher.as_ref(), &payload[4..], idx)?;
     std::fs::create_dir_all(pu.temp_path.parent().unwrap_or(std::path::Path::new(".")))?;
     let offset = (idx * nsmt_core::frame::CHUNK_SIZE as u64) as u64;
     use std::io::{Seek, SeekFrom, Write};
     let mut f = std::fs::OpenOptions::new().create(true).write(true).open(&pu.temp_path)?;
     f.seek(SeekFrom::Start(offset))?;
-    f.write_all(data)?;
+    f.write_all(&data)?;
     pu.received[idx as usize] = true;
     pu.received_count += 1;
     Ok(())

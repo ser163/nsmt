@@ -594,9 +594,26 @@ async fn conflicts_cli(args: &[String]) -> anyhow::Result<()> {
             _ => {
                 println!("冲突文件: {}", conflict_path.display());
                 println!("主文件: {}", main_path.display());
-                println!("冲突内容:
-{}", String::from_utf8_lossy(&conflict_bytes));
-                println!("解决: yggd merge <冲突文件> --keep-local | --keep-remote");
+                println!("冲突内容（本地修改版）:\n{}", String::from_utf8_lossy(&conflict_bytes));
+                let main_bytes = std::fs::read(&main_path).unwrap_or_default();
+                println!("主文件内容（远端版）:\n{}", String::from_utf8_lossy(&main_bytes));
+                use std::io::Write as _;
+                print!("解决方式 [l]ocal=保留本地修改 / [r]emote=保留远端 / [c]ancel: ");
+                std::io::stdout().flush()?;
+                let mut input = String::new();
+                std::io::stdin().read_line(&mut input)?;
+                match input.trim() {
+                    "l" | "L" => {
+                        std::fs::write(&main_path, &conflict_bytes)?;
+                        std::fs::remove_file(&conflict_path)?;
+                        println!("已保留本地修改并覆盖主文件");
+                    }
+                    "r" | "R" => {
+                        std::fs::remove_file(&conflict_path)?;
+                        println!("已保留远端版本，删除冲突副本");
+                    }
+                    _ => println!("已取消"),
+                }
             }
         }
         return Ok(());

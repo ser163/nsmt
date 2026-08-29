@@ -13,6 +13,7 @@ hex.workspace = true
 thiserror.workspace = true
 ed25519-dalek.workspace = true
 rand_core.workspace = true
+chacha20poly1305.workspace = true
 machine-uid.workspace = true
 hostname.workspace = true
 tokio.workspace = true

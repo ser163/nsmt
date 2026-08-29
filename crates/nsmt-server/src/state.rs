@@ -15,6 +15,16 @@ pub struct ServerState {
     pub object_stores: Arc<tokio::sync::RwLock<std::collections::HashMap<String, Arc<dyn nsmt_fs::ObjectStore>>>>,
     /// 对象 → 上传机器（P2P 路由用）。
     pub object_owners: Arc<tokio::sync::RwLock<std::collections::HashMap<String, std::collections::HashMap<String, String>>>>,
+    /// 每租户已用字节（配额）。
+    pub usage_bytes: Arc<tokio::sync::RwLock<std::collections::HashMap<String, u64>>>,
+}
+
+/// 租户配额（默认 1 GiB）。
+pub fn quota_bytes() -> u64 {
+    std::env::var("NSMT_QUOTA_BYTES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1024 * 1024 * 1024)
 }
 
 impl ServerState {
@@ -25,7 +35,19 @@ impl ServerState {
             pool: crate::memory::pool_from_env(),
             object_stores: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
             object_owners: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
+            usage_bytes: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
         }
+    }
+
+    /// 检查并预占配额（对象尚未存储时）。超限返回 false。
+    pub async fn try_reserve_quota(&self, user_domain: &str, size: u64) -> bool {
+        let mut g = self.usage_bytes.write().await;
+        let used = g.get(user_domain).copied().unwrap_or(0);
+        if used + size > quota_bytes() {
+            return false;
+        }
+        *g.entry(user_domain.to_string()).or_default() += size;
+        true
     }
 
     /// 记录某对象归属的机器（P2P 用）。

@@ -204,8 +204,19 @@ where
         total_chunks,
         size: bytes.len() as u64,
     }).await?;
-    // 读初始 ack（已拥有块列表）
-    let ack: FilePutAck = read_until(fs, FrameType::FilePutAck).await?.payload_json()?;
+    // 读初始 ack（已拥有块列表）；配额/错误时服务器回 Error → 中止
+    let ack_frame = loop {
+        let f = fs.recv().await?.ok_or_else(|| anyhow::anyhow!("eof"))?;
+        if f.frame_type == FrameType::FilePutAck || f.frame_type == FrameType::Error {
+            break f;
+        }
+    };
+    if ack_frame.frame_type == FrameType::Error {
+        let e: nsmt_core::messages::ErrorMsg = ack_frame.payload_json()?;
+        tracing::warn!("upload rejected: {} ({})", e.message, e.code);
+        return Ok(());
+    }
+    let ack: FilePutAck = ack_frame.payload_json()?;
     for idx in 0..total_chunks {
         if ack.have.contains(&idx) {
             continue; // 已传过（续传）
@@ -213,8 +224,14 @@ where
         let start = (idx * nsmt_core::frame::CHUNK_SIZE as u64) as usize;
         let end = std::cmp::min(start + nsmt_core::frame::CHUNK_SIZE, bytes.len());
         let mut payload = (idx as u32).to_le_bytes().to_vec();
-        payload.extend_from_slice(&bytes[start..end]);
-        fs.send(&Frame::new(FrameType::FileChunk, 0, payload)).await?;
+        let cipher = nsmt_core::e2e::e2e_key_from_env();
+        let enc = nsmt_core::e2e::encrypt_payload(cipher.as_ref(), &bytes[start..end], idx)?;
+        payload.extend_from_slice(&enc);
+        let mut f = Frame::new(FrameType::FileChunk, 0, payload);
+        if cipher.is_some() {
+            f.flags = nsmt_core::frame::Flags(0x01); // bit0: E2E 加密
+        }
+        fs.send(&f).await?;
     }
     // 读完成 ack
     let done: FilePutAck = read_until(fs, FrameType::FilePutAck).await?.payload_json()?;
@@ -307,12 +324,12 @@ where
                     return Ok(Some(out));
                 }
                 let got_idx = u32::from_le_bytes([resp.payload[0], resp.payload[1], resp.payload[2], resp.payload[3]]) as u64;
-                let data = &resp.payload[4..];
                 if got_idx != idx {
-                    // 服务器返回了别的块？忽略（或按序重试）
                     continue;
                 }
-                out.extend_from_slice(data);
+                let cipher = nsmt_core::e2e::e2e_key_from_env();
+                let data = nsmt_core::e2e::decrypt_payload(cipher.as_ref(), &resp.payload[4..], idx)?;
+                out.extend_from_slice(&data);
                 if data.len() < nsmt_core::frame::CHUNK_SIZE {
                     return Ok(Some(out)); // 最后一块
                 }
