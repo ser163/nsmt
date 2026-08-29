@@ -6,6 +6,7 @@ members = [
     "crates/nsmt-client",
     "crates/nsmt-memory",
     "crates/nsmt-fs",
+    "crates/nsmt-admin",
 ]
 
 [workspace.package]

@@ -1,0 +1,17 @@
+[package]
+name = "nsmt-admin"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "NSMT ygg-admin：独立监督器 + Web 管理后台（M7）"
+
+[dependencies]
+nsmt-core = { path = "../nsmt-core" }
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+axum.workspace = true
+reqwest.workspace = true
