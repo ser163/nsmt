@@ -1,0 +1,90 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>NSMT / Yggdrasil — Net Share Memory Tree</title>
+<meta name="description" content="NSMT (Yggdrasil) — multi-tenant, multi-machine, multi-agent shared memory + shared file network layer (Rust, QUIC).">
+<style>
+  :root { --accent: #2f6fed; --bg: #0d1117; --card: #161b22; --fg: #e6edf3; --muted: #8b949e; --border: #30363d; }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif; background: var(--bg); color: var(--fg); line-height: 1.6; }
+  .wrap { max-width: 860px; margin: 0 auto; padding: 48px 24px; }
+  .badge { display: inline-block; font-size: 12px; padding: 2px 10px; border-radius: 12px; background: #1f6feb33; color: #58a6ff; border: 1px solid #1f6feb66; margin-right: 6px; margin-bottom: 6px; }
+  h1 { font-size: 34px; letter-spacing: -0.5px; }
+  h1 .sub { color: var(--muted); font-weight: 400; font-size: 18px; }
+  .lead { color: var(--muted); margin: 12px 0 28px; font-size: 15px; }
+  .card { background: var(--card); border: 1px solid var(--border); border-radius: 12px; padding: 20px 24px; margin-bottom: 20px; }
+  h2 { font-size: 16px; margin-bottom: 12px; color: #58a6ff; }
+  ul { padding-left: 20px; color: var(--fg); }
+  li { margin: 4px 0; }
+  code, pre { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+  pre { background: #010409; border: 1px solid var(--border); border-radius: 8px; padding: 14px; overflow-x: auto; font-size: 13px; }
+  a { color: #58a6ff; text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; }
+  .bin { border: 1px solid var(--border); border-radius: 8px; padding: 12px; text-align: center; }
+  .bin .name { font-size: 18px; color: #7ee787; }
+  .bin .desc { font-size: 12px; color: var(--muted); margin-top: 4px; }
+  footer { color: var(--muted); font-size: 13px; text-align: center; margin-top: 32px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>NSMT <span class="sub">/ Yggdrasil — Net Share Memory Tree</span></h1>
+  <p class="lead">
+    A multi-tenant, multi-machine, multi-agent <b>shared memory + shared file</b> network layer in Rust (QUIC).<br>
+    多租户、多机器、多 agent 的「共享记忆 + 共享文件」网络层：不同机器上的 agent 在同一用户域下共享记忆树与文件。
+  </p>
+
+  <div>
+    <span class="badge">Rust</span><span class="badge">QUIC</span><span class="badge">P2P</span>
+    <span class="badge">shared memory</span><span class="badge">file sync</span><span class="badge">multi-agent</span>
+    <span class="badge">E2E encryption</span><span class="badge">multi-tenant</span>
+  </div>
+
+  <div class="card">
+    <h2>✦ Features / 特性</h2>
+    <ul>
+      <li>Identity &amp; tenancy: FQN (<code>user_domain/machine_id/agent_tag</code>) + Ed25519 domain/machine auth</li>
+      <li>Shared memory: domain pool (authoritative) + local fallback, dual-write, network-first recall, sharded pools</li>
+      <li>Shared files: CAS objects + directory trees + lease locks + resume + conflict copies</li>
+      <li>P2P: application-layer peer auth (domain-key signature) + NAT hole punching</li>
+      <li>E2E encryption: per-tenant derived keys + seamless key rotation (ChaCha20-Poly1305)</li>
+      <li>Management: user system, per-user quota, <code>ygg-admin</code> supervisor + Web UI, backup/restore</li>
+    </ul>
+  </div>
+
+  <div class="card">
+    <h2>⚙ Binaries / 二进制</h2>
+    <div class="grid">
+      <div class="bin"><div class="name">ygg</div><div class="desc">relay server + control API</div></div>
+      <div class="bin"><div class="name">yggd</div><div class="desc">agent daemon + conflict Web GUI</div></div>
+      <div class="bin"><div class="name">ygg-admin</div><div class="desc">supervisor + Web admin console</div></div>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>🚀 Quick Start / 快速开始</h2>
+    <pre>cargo build --release
+NSMT_ADMIN_TOKEN=secret ./target/release/nsmt-server 0.0.0.0:5555 --control 127.0.0.1:8091
+NSMT_USER_DOMAIN=ser163 NSMT_AGENT_TAG=maka ./target/release/nsmt-client 127.0.0.1:5555
+# conflict merge Web GUI:  ./target/release/nsmt-client 127.0.0.1:5555 conflicts-web 8088</pre>
+  </div>
+
+  <div class="card">
+    <h2>📚 Docs / 文档</h2>
+    <ul>
+      <li><a href="https://github.com/ser163/nsmt/blob/master/README.md">README (English)</a> · <a href="https://github.com/ser163/nsmt/blob/master/README.zh-CN.md">README (中文)</a></li>
+      <li><a href="https://github.com/ser163/nsmt/blob/master/protocol/protocol.md">Protocol spec（协议规范）</a> — single source of truth</li>
+      <li><a href="https://github.com/ser163/nsmt/blob/master/ARCHITECTURE.md">Architecture（架构）</a> · <a href="https://github.com/ser163/nsmt/blob/master/DEV-ROADMAP.md">Roadmap（规划）</a></li>
+      <li><a href="https://github.com/ser163/nsmt/tree/master/deploy">Deployment（部署）</a> · <a href="https://github.com/ser163/nsmt/blob/master/docs/项目策划.md">Requirements（需求策划）</a></li>
+    </ul>
+  </div>
+
+  <footer>
+    Status: M0–M9 + backlog implemented ✅ · MIT License · <a href="https://github.com/ser163/nsmt">github.com/ser163/nsmt</a>
+  </footer>
+</div>
+</body>
+</html>
