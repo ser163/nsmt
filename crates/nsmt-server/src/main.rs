@@ -1,7 +1,10 @@
 //! NSMT 服务器 `ygg` — M0：QUIC 监听 + 握手/注册 + 在线注册表 + 广播。
 
+mod fs;
+mod memory;
 mod registry;
 mod session;
+mod state;
 
 use anyhow::Context;
 use std::net::SocketAddr;
@@ -38,17 +41,18 @@ async fn main() -> anyhow::Result<()> {
     let endpoint =
         quinn::Endpoint::server(server_config, bind).context("bind quinn endpoint")?;
 
-    let registry = Arc::new(registry::Registry::default());
-    tokio::spawn(registry.clone().prune_loop());
+    let state = Arc::new(state::ServerState::new());
+    tokio::spawn(state.registry.clone().prune_loop());
+    tokio::spawn(state.locks.clone().cleanup_loop());
 
     tracing::info!("ygg listening on {bind} (QUIC)");
 
     while let Some(conn) = endpoint.accept().await {
-        let registry = registry.clone();
+        let state = state.clone();
         tokio::spawn(async move {
             match conn.await {
                 Ok(c) => {
-                    if let Err(e) = session::handle(c, registry).await {
+                    if let Err(e) = session::handle(c, state).await {
                         tracing::debug!("session ended: {e}");
                     }
                 }

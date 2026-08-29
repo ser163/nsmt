@@ -9,3 +9,6 @@ description = "腾讯记忆 Gateway HTTP 桥接（recall/capture/search/health�
 nsmt-core = { path = "../nsmt-core" }
 serde.workspace = true
 serde_json.workspace = true
+reqwest.workspace = true
+tokio.workspace = true
+thiserror.workspace = true

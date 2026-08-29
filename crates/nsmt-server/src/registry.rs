@@ -45,16 +45,16 @@ impl Registry {
         tenant.machines.values().cloned().collect()
     }
 
-    /// 订阅租户广播，返回（当前快照, 接收通道）。
+    /// 订阅租户广播，返回（当前快照, 发送端, 接收通道）。
     pub async fn subscribe(
         &self,
         user_domain: &str,
-    ) -> (Vec<MachineInfo>, mpsc::UnboundedReceiver<Frame>) {
+    ) -> (Vec<MachineInfo>, mpsc::UnboundedSender<Frame>, mpsc::UnboundedReceiver<Frame>) {
         let mut g = self.inner.write().await;
         let tenant = g.entry(user_domain.to_string()).or_default();
         let (tx, rx) = mpsc::unbounded_channel();
-        tenant.subscribers.push(tx);
-        (tenant.machines.values().cloned().collect(), rx)
+        tenant.subscribers.push(tx.clone());
+        (tenant.machines.values().cloned().collect(), tx, rx)
     }
 
     pub async fn unsubscribe(&self, user_domain: &str, tx: &mpsc::UnboundedSender<Frame>) {
@@ -80,6 +80,23 @@ impl Registry {
         if let Some(t) = g.get(user_domain) {
             for tx in &t.subscribers {
                 let _ = tx.send(frame.clone());
+            }
+        }
+    }
+
+    /// 广播一帧，但排除某个订阅者（如刚注册的客户端自身）。
+    pub async fn broadcast_except(
+        &self,
+        user_domain: &str,
+        frame: Frame,
+        except: &mpsc::UnboundedSender<Frame>,
+    ) {
+        let g = self.inner.read().await;
+        if let Some(t) = g.get(user_domain) {
+            for tx in &t.subscribers {
+                if !tx.same_channel(except) {
+                    let _ = tx.send(frame.clone());
+                }
             }
         }
     }

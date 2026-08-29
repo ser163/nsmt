@@ -1,12 +1,16 @@
 //! 会话处理：每个 QUIC 连接一个任务。
 //!
-//! 状态机：HELLO → AUTH → REGISTER → ready（心跳 + 订阅广播）。
-//! M0 开发期：AUTH 签名不做强校验（M1/M3 补真实 Ed25519 验证）。
+//! 状态机：HELLO → AUTH → REGISTER → ready（心跳 + 记忆/文件/锁帧分发）。
+//! M0/M1：AUTH 签名不做强校验（M3 补真实 Ed25519 验证）。
 
-use crate::registry::Registry;
+use crate::fs::{tree_hash, ServerFs};
+use crate::state::ServerState;
 use nsmt_core::frame::{Frame, FrameType};
 use nsmt_core::messages::{
-    Auth, Hello, HelloAck, MachineInfo, OnlineDelta, OnlineDeltaKind, Register, RegisterAck,
+    Auth, FileDiff, FileDiffResult, FileGet, FilePut, FileTree, Hello, HelloAck, LockAcquire,
+    LockDenied, LockGranted, LockNotify, LockRelease, LockRenew, MachineInfo, MemoryCapture,
+    MemoryCaptureResult, MemoryRecall, MemoryRecallResult, OnlineDelta, OnlineDeltaKind, Register,
+    RegisterAck,
 };
 use nsmt_core::FrameStream;
 use std::sync::Arc;
@@ -24,7 +28,7 @@ fn nonce() -> String {
     format!("nsmt-nonce-{}-{}", now_ms(), generate_machine_id().0)
 }
 
-pub async fn handle(conn: quinn::Connection, registry: Arc<Registry>) -> anyhow::Result<()> {
+pub async fn handle(conn: quinn::Connection, state: Arc<ServerState>) -> anyhow::Result<()> {
     let (send, recv) = conn.accept_bi().await?;
     let mut fs = FrameStream::new(recv, send);
 
@@ -36,14 +40,10 @@ pub async fn handle(conn: quinn::Connection, registry: Arc<Registry>) -> anyhow:
     let hello: Hello = frame.payload_json()?;
     tracing::info!("HELLO from {:?} (client={})", hello.user_domain, hello.client);
 
-    // ── HELLO_ACK ──
-    let ack = HelloAck {
-        nonce: nonce(),
-        tenant_exists: true,
-    };
-    fs.send_json(FrameType::HelloAck, 0, &ack).await?;
+    fs.send_json(FrameType::HelloAck, 0, &HelloAck { nonce: nonce(), tenant_exists: true })
+        .await?;
 
-    // ── AUTH（M0 不强校验签名）──
+    // ── AUTH（M0/M1 不强校验）──
     let frame = fs.recv().await?.ok_or_else(|| anyhow::anyhow!("eof before auth"))?;
     let _auth: Auth = frame.payload_json()?;
 
@@ -59,78 +59,163 @@ pub async fn handle(conn: quinn::Connection, registry: Arc<Registry>) -> anyhow:
         last_seen: now_ms(),
     };
 
-    let snapshot = registry.register(&user_domain, info.clone()).await;
-    let ack = RegisterAck { machines: snapshot };
-    fs.send_json(FrameType::RegisterAck, 0, &ack).await?;
+    let snapshot = state.registry.register(&user_domain, info.clone()).await;
+    fs.send_json(FrameType::RegisterAck, 0, &RegisterAck { machines: snapshot }).await?;
 
-    // 订阅租户广播
-    let (_, mut rx) = registry.subscribe(&user_domain).await;
-
-    // 广播 join
-    registry
-        .broadcast(
+    let (_, my_tx, mut rx) = state.registry.subscribe(&user_domain).await;
+    state
+        .registry
+        .broadcast_except(
             &user_domain,
             Frame::from_json(
                 FrameType::OnlineDelta,
                 0,
-                &OnlineDelta {
-                    kind: OnlineDeltaKind::Join,
-                    machine: info,
-                },
+                &OnlineDelta { kind: OnlineDeltaKind::Join, machine: info },
             )?,
+            &my_tx,
         )
         .await;
 
-    tracing::info!(
-        "machine registered: {} @ {} (agents={:?})",
-        reg.machine_id,
-        user_domain,
-        reg.agent_tag
+    // 租户文件存储
+    let server_fs = ServerFs::new(
+        std::path::Path::new(&std::env::var("NSMT_HOME").unwrap_or_else(|_| {
+            std::env::var("HOME").unwrap_or_else(|_| ".".into())
+        })),
+        &user_domain,
     );
 
-    // ── ready：心跳 + 订阅广播循环 ──
+    tracing::info!("machine registered: {} @ {} (agents={})", reg.machine_id, user_domain, reg.agent_tag);
+
+    // ── ready 循环 ──
     let mut heartbeat = tokio::time::interval(crate::registry::HEARTBEAT_INTERVAL);
-    heartbeat.tick().await; // 首次立即
+    heartbeat.tick().await;
+
+    // 文件上传缓冲（FILE_PUT 后跟 FILE_CHUNK）
+    let mut pending_put: Option<FilePut> = None;
 
     loop {
         tokio::select! {
-            _ = heartbeat.tick() => {
-                registry.heartbeat(&user_domain, &reg.machine_id).await;
-            }
+            _ = heartbeat.tick() => { state.registry.heartbeat(&user_domain, &reg.machine_id).await; }
             ev = rx.recv() => {
                 match ev {
-                    Some(frame) => {
-                        if fs.send(&frame).await.is_err() {
-                            break;
-                        }
-                    }
+                    Some(frame) => { if fs.send(&frame).await.is_err() { break; } }
                     None => break,
                 }
             }
             got = fs.recv() => {
                 match got {
-                    Ok(Some(f)) => {
-                        match f.frame_type {
+                    Ok(Some(frame)) => {
+                        if let Some(fp) = pending_put.take() {
+                            // 收到对象数据
+                            server_fs.put_object(&fp.blob_id, &frame.payload)?;
+                            tracing::debug!("object stored: {}", fp.blob_id);
+                            continue;
+                        }
+                        match frame.frame_type {
                             FrameType::Heartbeat => {
-                                registry.heartbeat(&user_domain, &reg.machine_id).await;
+                                state.registry.heartbeat(&user_domain, &reg.machine_id).await;
                             }
-                            _ => {
-                                // M1 起处理记忆/文件/锁帧
-                                tracing::debug!("unhandled frame {:?} in M0", f.frame_type);
+                            FrameType::MemoryRecall => {
+                                let msg: MemoryRecall = frame.payload_json()?;
+                                match state.pool.recall(&msg).await {
+                                    Ok(r) => fs.send_json(FrameType::MemoryRecallResult, 0, &r).await?,
+                                    Err(e) => {
+                                        tracing::warn!("pool recall failed: {e}");
+                                        // 客户端应回退本地托底
+                                        let r = MemoryRecallResult {
+                                            request_id: msg.request_id,
+                                            source: "pool_unavailable".into(),
+                                            memories: Vec::new(),
+                                            latency_ms: 0,
+                                        };
+                                        fs.send_json(FrameType::MemoryRecallResult, 0, &r).await?;
+                                    }
+                                }
                             }
+                            FrameType::MemoryCapture => {
+                                let msg: MemoryCapture = frame.payload_json()?;
+                                match state.pool.capture(&msg).await {
+                                    Ok(r) => fs.send_json(FrameType::MemoryCaptureResult, 0, &r).await?,
+                                    Err(e) => {
+                                        tracing::warn!("pool capture failed: {e}");
+                                        fs.send_json(FrameType::MemoryCaptureResult, 0, &MemoryCaptureResult {
+                                            request_id: msg.request_id,
+                                            committed: false,
+                                            queued: true,
+                                        }).await?;
+                                    }
+                                }
+                            }
+                            FrameType::FileTree => {
+                                let mut tree: FileTree = frame.payload_json()?;
+                                tree.tree_hash = tree_hash(&tree);
+                                server_fs.save_tree(&tree)?;
+                                tracing::info!("tree updated: {} entries={}", tree.tree_hash, tree.entries.len());
+                            }
+                            FrameType::FileDiff => {
+                                let diff: FileDiff = frame.payload_json()?;
+                                let old = diff.new_tree.as_ref().and_then(|h| server_fs.get_tree(h));
+                                let latest = server_fs.latest_tree();
+                                let (changed, removed) = ServerFs::diff(old.as_ref(), latest.as_ref());
+                                let resp = FileDiffResult { changed, removed, tree: latest };
+                                fs.send_json(FrameType::FileDiffResult, 0, &resp).await?;
+                            }
+                            FrameType::FileGet => {
+                                let g: FileGet = frame.payload_json()?;
+                                match server_fs.get_object(&g.blob_id) {
+                                    Some(data) => {
+                                        let c = Frame::new(FrameType::FileChunk, 0, data);
+                                        fs.send(&c).await?;
+                                    }
+                                    None => {
+                                        let e = nsmt_core::messages::ErrorMsg {
+                                            code: "0xE020".into(),
+                                            message: "object not found".into(),
+                                            request_id: None,
+                                        };
+                                        fs.send_json(FrameType::Error, 0, &e).await?;
+                                    }
+                                }
+                            }
+                            FrameType::FilePut => {
+                                let fp: FilePut = frame.payload_json()?;
+                                pending_put = Some(fp);
+                            }
+                            FrameType::LockAcquire => {
+                                let l: LockAcquire = frame.payload_json()?;
+                                match state.locks.acquire(&l.path, &l.requester, l.ttl_ms).await {
+                                    Ok(exp) => {
+                                        fs.send_json(FrameType::LockGranted, 0, &LockGranted { path: l.path.clone(), expires_at: exp }).await?;
+                                        state.registry.broadcast_except(&user_domain, Frame::from_json(FrameType::LockNotify, 0, &LockNotify { path: l.path, event: "locked".into(), holder: Some(l.requester.clone()) })?, &my_tx).await;
+                                    }
+                                    Err(holder) => {
+                                        fs.send_json(FrameType::LockDenied, 0, &LockDenied { path: l.path, holder }).await?;
+                                    }
+                                }
+                            }
+                            FrameType::LockRenew => {
+                                let l: LockRenew = frame.payload_json()?;
+                                let ok = state.locks.renew(&l.path, &l.requester, 30_000).await;
+                                fs.send_json(FrameType::LockGranted, 0, &LockGranted { path: l.path, expires_at: now_ms() + 30_000 }).await?;
+                                let _ = ok;
+                            }
+                            FrameType::LockRelease => {
+                                let l: LockRelease = frame.payload_json()?;
+                                state.locks.release(&l.path, &l.requester).await;
+                                state.registry.broadcast_except(&user_domain, Frame::from_json(FrameType::LockNotify, 0, &LockNotify { path: l.path, event: "unlocked".into(), holder: None })?, &my_tx).await;
+                            }
+                            _ => { tracing::debug!("unhandled frame {:?}", frame.frame_type); }
                         }
                     }
                     Ok(None) => break,
-                    Err(e) => {
-                        tracing::debug!("recv error: {e}");
-                        break;
-                    }
+                    Err(e) => { tracing::debug!("recv error: {e}"); break; }
                 }
             }
         }
     }
 
-    registry
+    state
+        .registry
         .broadcast(
             &user_domain,
             Frame::from_json(
@@ -138,12 +223,7 @@ pub async fn handle(conn: quinn::Connection, registry: Arc<Registry>) -> anyhow:
                 0,
                 &OnlineDelta {
                     kind: OnlineDeltaKind::Leave,
-                    machine: MachineInfo {
-                        machine_id: reg.machine_id,
-                        agents: Vec::new(),
-                        addr: String::new(),
-                        last_seen: 0,
-                    },
+                    machine: MachineInfo { machine_id: reg.machine_id, agents: Vec::new(), addr: String::new(), last_seen: 0 },
                 },
             )?,
         )

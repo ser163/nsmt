@@ -150,13 +150,18 @@ pub struct FileTreeEntry {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileDiff {
     pub old_tree: String,
-    pub new_tree: String,
+    /// 客户端不知道远端最新树时省略；服务端以最新树应答。
+    #[serde(default)]
+    pub new_tree: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileDiffResult {
     pub changed: Vec<String>,
     pub removed: Vec<String>,
+    /// 最新目录树（客户端据此拿 blob_id 拉取）。
+    #[serde(default)]
+    pub tree: Option<FileTree>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

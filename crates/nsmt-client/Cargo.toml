@@ -7,6 +7,9 @@ description = "NSMT 客户端 yggd：agent 侧 daemon"
 
 [dependencies]
 nsmt-core = { path = "../nsmt-core" }
+nsmt-memory = { path = "../nsmt-memory" }
+sha2.workspace = true
+hex.workspace = true
 tokio.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -17,3 +20,4 @@ anyhow.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 ed25519-dalek.workspace = true
+notify.workspace = true
