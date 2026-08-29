@@ -1,0 +1,12 @@
+[package]
+name = "nsmt-client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "NSMT 客户端 yggd：agent 侧 daemon"
+
+[dependencies]
+nsmt-core = { path = "../nsmt-core" }
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true

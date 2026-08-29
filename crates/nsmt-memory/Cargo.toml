@@ -1,0 +1,11 @@
+[package]
+name = "nsmt-memory"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "腾讯记忆 Gateway HTTP 桥接（recall/capture/search/health）"
+
+[dependencies]
+nsmt-core = { path = "../nsmt-core" }
+serde.workspace = true
+serde_json.workspace = true

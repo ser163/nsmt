@@ -1,0 +1,26 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/nsmt-core",
+    "crates/nsmt-server",
+    "crates/nsmt-client",
+    "crates/nsmt-memory",
+    "crates/nsmt-fs",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/ser163/TencentDB-Agent-Memory" # 待定：NSMT 独立仓库后更新
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+hex = "0.4"
+thiserror = "2"
+ed25519-dalek = "2"
+machine-uid = "0.6"
+hostname = "0.4"
+tokio = { version = "1", features = ["full"] }

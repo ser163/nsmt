@@ -1,0 +1,12 @@
+[package]
+name = "nsmt-fs"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "共享文件系统：CAS 对象库 + 目录树 + 锁"
+
+[dependencies]
+nsmt-core = { path = "../nsmt-core" }
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true

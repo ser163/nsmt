@@ -1,0 +1,12 @@
+[package]
+name = "nsmt-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "NSMT 服务器 ygg：relay + registry + 锁 + 记忆/文件服务"
+
+[dependencies]
+nsmt-core = { path = "../nsmt-core" }
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
