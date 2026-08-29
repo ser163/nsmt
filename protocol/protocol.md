@@ -187,6 +187,32 @@ yggd                                    ygg
 - **心跳**：每 10s `HEARTBEAT`；服务器 3 次未收到 → 标记离线 → 广播 `ONLINE_DELTA leave`；
 - **断线重连**：QUIC 0-RTT + 旧票据续期，重连后自动补 `ONLINE_LIST` 差异与待同步队列。
 
+### 5.1 P2P 连接与对等认证（M9.1）
+
+P2P 直连（yggd ↔ yggd，经服务器发现地址）在数据交换前先做**应用层对等认证**（替换 dev no-verify TLS 作为信任基础）：
+
+```
+A (fetch)                              B (owner)
+  │  QUIC connect (TLS 自签)            │
+  ├────────── PEER_HELLO ─────────────▶│   { user_domain, machine_id, agent_tag, machine_pubkey }
+  │◀────────── PEER_AUTH ──────────────┤   { nonce }
+  ├──── PEER_AUTH_OK (域密钥签名) ──────▶│   { machine_id, agent_tag, machine_pubkey, signature }
+  │◀────────── PEER_AUTH_OK (确认) ─────┤   B 对同一 nonce 签名，供 A 验证 B
+  │═══════ FILE_GET / FILE_CHUNK ═══════│
+```
+
+- 双方都用**用户域私钥**（同域共享 `domain.key`）对 nonce 签名，对方用同域公钥验证 → 证明持有域私钥且同域；
+- 失败：直接断开，不服务 `FILE_GET`；
+- 打洞连接（`PEER_HINT` 触发）只建立 QUIC + 开流即关闭，NAT 映射打开后由后续真实拉取复用。
+
+### 5.2 NAT 打洞（M9.1）
+
+1. 服务器在 `REGISTER` 时记录客户端**外部地址**（`conn.remote_address`）到 `MachineInfo.addr`；
+2. 客户端 `FILE_GET` 服务器 miss → 服务器返回 `ERROR object not found; peer=<owner_peer_addr>`，
+   并向租户广播 `PEER_HINT { blob_id, requester_addr }`（requester 外部地址）；
+3. 持有者收到 `PEER_HINT` 且本地有该对象 → 主动 `hole_punch`（QUIC connect requester_addr，开流即关）打开 NAT 映射；
+4. requester 随后直连 owner（peer_addr 或 addr 任一可达）→ 走 §5.1 对等认证 → 拉取。
+
 ---
 
 ## 6. 记忆协议
@@ -197,6 +223,7 @@ yggd                                    ygg
 |---|---|
 | 本机记忆 | 本地腾讯 Gateway，`instanceId = machine_id` |
 | 域池记忆 | 服务器上该租户的 Gateway 实例（`t/<user_domain>/memory`） |
+| 域池分片（M9.5） | `NSMT_POOL_GATEWAYS` 逗号分隔多网关；recall fan-out 聚合、capture 按 fqn 哈希路由 |
 | scope=user | 双写：域池 + 本地 |
 | scope=machine/agent | 只写本地 |
 
@@ -214,8 +241,8 @@ yggd                                    ygg
 ```
 
 服务器行为（`scope=user`）：
-1. 转发到**域池** Gateway `/recall`；
-2. **成功** → 返回 `MEMORY_RECALL_RESULT`（标注 `source=pool`）；
+1. 转发到**域池** Gateway `/recall`（M9.5 分片模式：fan-out 到所有分片并发查询，按内容稳定排序截断 top `limit`）；
+2. **成功** → 返回 `MEMORY_RECALL_RESULT`（标注 `source=pool`）；全部 shard 失败 → `source=pool_unavailable`；
 3. **超时/失败** → 回退：若 `fallback_on_timeout`，向该客户端返回 `MEMORY_RECALL_RESULT`（`source=local` 指令，客户端转查本地托底）；或服务器直接返回错误码，由客户端本地兜底。
 
 `MEMORY_RECALL_RESULT`：
@@ -278,7 +305,16 @@ yggd                                    ygg
 1. 客户端 A 变更文件 → 写本地 CAS + 更新本地 tree；
 2. A → 服务器 `FILE_PUT`（对象，chunk 分片 `FILE_CHUNK`）+ `FILE_TREE`（新 tree_hash）；
 3. 服务器更新 `t/<domain>/trees/<tree_hash>`，并向其它在线客户端推送 `ONLINE` 事件或让它们下次 `FILE_DIFF` 拉取；
-4. 客户端 B 收到提示 → `FILE_DIFF`（old_tree → new_tree）→ 服务器返回差异 → B 按需 `FILE_GET` 补齐缺失对象。
+4. 客户端 B 收到提示 → `FILE_DIFF`（old_tree → new_tree）→ 服务器返回差异 → B 按需 `FILE_GET` 补齐缺失对象；
+5. **启动先拉后推（M9 修正）**：客户端 fs 模式启动先 `FILE_DIFF` 并拉取远端变更，再推本地树 —— 空目录不会覆盖共享树；
+6. 服务器 miss（对象缺失）→ 返回 `peer=` 提示 + 广播 `PEER_HINT`（见 §5.2）→ B 直连持有者拉取（对等认证）。
+
+### 7.3.1 对象存储与多租户前缀（M9.3）
+
+| 后端 | 租户隔离方式 |
+|---|---|
+| 本地 FS | 根目录 `~/.nsmt/server/<user_domain>/objects/` 天然隔离 |
+| S3 / 内存（共享后端） | key 加前缀 **`t/<user_domain>/objects/`**（`PrefixedObjectStore`），同一 bucket 内按租户隔离 |
 
 ### 7.4 断点续传
 
@@ -331,6 +367,7 @@ yggd                                    ygg
 | 0xE031 | lock_timeout |
 | 0xE040 | quota_exceeded |
 | 0xE041 | rate_limited |
+| 0xE050 | peer_auth_failed（P2P 对等认证失败，M9.1） |
 | 0xE0FF | internal_error |
 
 `ERROR` 帧：
@@ -370,11 +407,40 @@ yggd                                    ygg
 
 ## 12. 实现清单（对照）
 
-- [ ] 帧编解码（magic/version/flags/type/stream/len）
-- [ ] FQN 解析 + 机器码生成
-- [ ] 鉴权（HELLO/AUTH/TICKET/REGISTER）
-- [ ] 心跳 + ONLINE_LIST/DELTA
-- [ ] MEMORY_RECALL/CAPTURE（域池 + 托底 + 待同步队列）
-- [ ] FILE_TREE/DIFF/PUT/GET/CHUNK（CAS + symlink）
-- [ ] LOCK 全套（租约 + 续约 + 冲突副本）
-- [ ] ERROR 表 + 租户隔离测试
+- [x] 帧编解码（magic/version/flags/type/stream/len）
+- [x] FQN 解析 + 机器码生成
+- [x] 鉴权（HELLO/AUTH/REGISTER）+ 用户系统（M6，sqlx Any + argon2）
+- [x] 心跳 + ONLINE_LIST/DELTA
+- [x] MEMORY_RECALL/CAPTURE（域池 + 托底 + 固定记忆 note + 分片 fan-out）
+- [x] FILE_TREE/DIFF/PUT/GET/CHUNK（CAS + symlink + 断点续传 + S3 多租户前缀）
+- [x] LOCK 全套（租约 + 续约 + 冲突副本）
+- [x] P2P 对等认证 + NAT 打洞（PEER_* 帧 + PeerHint）
+- [x] 冲突合并（CLI + Web GUI `conflicts-web`）
+- [x] E2E 加密（按租户密钥 + 轮换）
+- [x] ERROR 表 + 租户隔离测试
+- [x] 管理面：控制 API（M6）/ ygg-admin 监督器 + Web UI（M7）/ 会员配额（M8）/ 备份恢复（待办池）
+
+---
+
+## 13. 管理面（HTTP 控制 API，M6+）
+
+> 管理面走 **HTTP/JSON**（非 QUIC 帧），`ygg --control 127.0.0.1:8091` 启用；
+> 鉴权：`NSMT_ADMIN_TOKEN` → 请求头 `x-admin-token`。`ygg-admin`（:8090）为监督器 + Web UI。
+
+| 端点 | 方法 | 说明 |
+|---|---|---|
+| `/api/status` | GET | 健康/uptime/pid/配额/用量 |
+| `/api/tenants` | GET/POST | 租户列表 + 用量 / 添加租户（域+公钥） |
+| `/api/online` | GET | 在线机器/agent |
+| `/api/locks` | GET | 锁状态 |
+| `/api/logs?lines=N[&filter=]` | GET | 日志 tail |
+| `/api/users/register` | POST | 自助注册（argon2，自动建租户） |
+| `/api/users/login` | POST | 登录发 token |
+| `/api/users` | GET | 用户列表 + plan + 用量 + 配额（M8 UI 数据源） |
+| `/api/users/{username}/upgrade` | POST | 会员升级 `{plan: free\|pro}`（M8） |
+| `/api/tenants/key` | POST | 用户登记客户端域公钥 |
+| `/api/admin/restart` | POST | 优雅重启（退出码 3，由 ygg-admin 拉起，M7） |
+| `/api/backup?domain=` | GET | 打包租户数据到 `backups/`（待办池） |
+| `/api/restore` | POST | 从备份恢复租户（待办池） |
+
+> 冲突合并 Web GUI 为**客户端本地**服务：`yggd conflicts-web [port]`（默认 127.0.0.1:8088）。

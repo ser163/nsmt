@@ -2,7 +2,7 @@
 
 > English primary · 中文为辅
 > `yggd` — agent-side daemon: connects to `ygg`, provides **shared memory** (dual-write/fallback)
-> and **shared files** (CAS/tree/lock/resume/P2P), plus conflict CLI.
+> and **shared files** (CAS/tree/lock/resume/P2P), plus conflict CLI / Web GUI.
 
 ## 1. Build (构建)
 
@@ -35,16 +35,17 @@ All via environment variables.
 | `NSMT_AGENT_TAG` | `maka` | this agent's tag on this machine |
 | `NSMT_MACHINE_ID` | auto (hardware hash) | override for testing multiple machines |
 | `NSMT_SERVER_CERT` | `~/.nsmt/ygg.crt` | trust the server's TLS cert |
-| `NSMT_SHARE_DIR` | `~/nsmt_share` | shared filesystem view (虚拟共享目录) |
+| `NSMT_SHARE_DIR` | `~/nsmt_share` | shared filesystem view (虚拟共享目录); written as fixed memory note on first run (M6.4) |
 | `NSMT_OBJECTS_DIR` | `~/.nsmt/objects` | local object cache |
 | `NSMT_POOL_GATEWAY` | `http://127.0.0.1:8420` | (via server) domain pool |
 | `NSMT_LOCAL_GATEWAY` | `http://127.0.0.1:8420` | local fallback memory |
-| `NSMT_E2E_KEY` | — | 32-byte hex; must match server & peers for encrypted sync |
+| `NSMT_E2E_KEY` / `NSMT_E2E_KEYS` | — | 32-byte hex key(s); must match server & peers; `NSMT_E2E_KEYS` = comma-separated, newest first (rotation M9.4); derived per-tenant |
 | `NSMT_SYMLINK_VIEW` | — | set to `1` to materialize share files as symlinks (on-demand pull) |
-| `NSMT_PEER_PORT` | `127.0.0.1:0` | P2P listener address (0 = ephemeral port) |
+| `NSMT_PEER_PORT` | `127.0.0.1:0` | P2P listener address (0 = ephemeral port); set a fixed port + reachable addr for NAT punching |
 | `RUST_LOG` | info | debug for verbose |
 
 **Keys** are auto-generated on first run: `~/.nsmt/domain.key|.pub`, `~/.nsmt/machine.key|.pub`.
+**Fixed memory (M6.4)**: first run writes the share dir as a shared-memory note (`nsmt:share_dir`) + local marker `~/.nsmt/share.path`.
 
 ## 4. First-run & tenant registration (首次运行与租户注册)
 
@@ -80,10 +81,10 @@ yggd 127.0.0.1:5555 recall "question"
 NSMT_SHARE_DIR=~/nsmt_share yggd 127.0.0.1:5555 fs
 # 1) write files in ~/nsmt_share on machine A
 # 2) they sync to machine B's ~/nsmt_share within ~5s (poll)
-# 3) conflicts are kept as .sync-conflict-* ; resolve via CLI below
+# 3) conflicts are kept as .sync-conflict-* ; resolve via CLI or Web GUI below
 ```
 
-### Conflict CLI (冲突合并)
+### Conflict CLI (冲突合并 CLI)
 
 ```bash
 yggd 127.0.0.1:5555 conflicts                          # list conflict copies
@@ -92,6 +93,19 @@ yggd 127.0.0.1:5555 merge .sync-conflict-xxx --keep-local
 yggd 127.0.0.1:5555 merge .sync-conflict-xxx --keep-remote
 # interactive: run merge without flag → choose [l]ocal / [r]emote / [c]ancel
 ```
+
+### Conflict merge Web GUI (冲突合并 Web GUI, M9.2)
+
+```bash
+yggd 127.0.0.1:5555 conflicts-web [port]     # default 127.0.0.1:8088
+# open http://127.0.0.1:8088 → 冲突列表 → 本地/远端并排预览 → 保留本地/远端/自定义合并
+```
+
+### P2P 直连与打洞 (M9.1)
+
+- 客户端默认起 P2P 监听器；对端连接时先做**域密钥签名对等认证**（不再信任任意 no-verify TLS）；
+- 服务器记录每台机器外部地址；对象 miss 时返回 peer 提示并向持有者广播 `PEER_HINT`，持有者主动打洞；
+- 跨 NAT 直连需要固定 `NSMT_PEER_PORT` 并在可达接口监听。
 
 ## 6. Run as background service (后台运行)
 
@@ -151,8 +165,9 @@ echo hi > ~/nsmt_share/a.txt; sleep 6; ls ~/nsmt_share   # synced on other machi
 | Issue | Check |
 |---|---|
 | `read server cert failed` | start `ygg` first; it writes `~/.nsmt/ygg.crt` |
-| AUTH failed | tenant registered? `ygg admin add-tenant` |
+| AUTH failed | tenant registered? `ygg admin add-tenant` or self-register via control API |
 | files not syncing | both in `fs` mode; `RUST_LOG=debug`; check server `diff:` logs |
-| E2E mismatch | `NSMT_E2E_KEY` must match server & peers |
+| E2E mismatch | `NSMT_E2E_KEY`/`NSMT_E2E_KEYS` must match server & peers; keep old keys during rotation |
+| P2P fetch failed / peer auth rejected | peer must be same user domain (shared domain.key); `NSMT_PEER_PORT` reachable; check `peer_auth_failed` |
 
-> 中文说明：首次运行自动生成密钥；先注册租户再连接；文件模式用 `fs`；冲突用 `conflicts`/`merge`。
+> 中文说明：首次运行自动生成密钥 + 写固定记忆 note；先注册租户再连接；文件模式用 `fs`；冲突用 `conflicts`/`merge` 或 `conflicts-web`。
