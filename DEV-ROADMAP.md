@@ -97,11 +97,37 @@
 - Memory vector DB 跨机聚合优化（域池分片）.
 - Admin web: process restart, backup/restore of tenants.
 
-## 7. Suggested Milestones
+## 7. Task Breakdown & Milestones (任务清单)
 
-| M | Scope |
-|---|---|
-| M6 | User DB + self-registration + per-user quota (50 MB) + fixed-memory note |
-| M7 | Web admin console (status/tenants/online/logs) |
-| M8 | Membership/plans + billing hooks; quota UI |
-| M9 | P2P hardening, conflict GUI, S3 multi-tenant |
+### M6 — ygg Control API + User System (进行中 ✅ in progress)
+
+- [ ] **M6.1 ygg 控制 API**（`ygg --control 127.0.0.1:8091`，axum 内嵌 HTTP）：
+  - [ ] `GET /api/status` 服务器健康/uptime/pid/配额/用量
+  - [ ] `GET /api/tenants` 租户列表+用量；`POST /api/tenants` 添加租户（域+公钥）
+  - [ ] `GET /api/online` 在线机器/agent；`GET /api/locks` 锁状态
+  - [ ] `GET /api/logs?lines=N` 日志 tail（NSMT_LOG_FILE）
+  - [ ] 控制 API 鉴权（admin token）
+- [ ] **M6.2 用户系统**：SQLite `users/sessions/invites/usage`；注册（可选邀请码）→ 登录 → 自动建租户；argon2 密码
+- [ ] **M6.3 配额按用户**：`users.plan` → 默认 50 MB（`NSMT_DEFAULT_QUOTA_BYTES=52428800`），替换全局 env；用量持久化
+- [ ] **M6.4 固定记忆**：客户端首次运行把共享目录写入共享记忆（note, key=`nsmt:share_dir`）
+
+### M7 — ygg-admin (独立监督器 + Web UI) (planned)
+
+- [ ] **M7.1 ygg-admin 监督器**：spawn/restart/kill ygg 子进程；健康/CPU/内存监控；崩溃自动拉起
+- [ ] **M7.2 Web UI**：状态页（进程/在线/用量）、租户管理、日志查看（tail + 过滤）
+- [ ] **M7.3 控制 API 客户端**：ygg-admin 轮询 ygg 控制 API 聚合展示
+
+### M8 — Membership & Quotas UI (planned)
+
+- [ ] `users.plan` = free(50MB) / pro(1GiB) …；配额 UI（用量条 + 升级 CTA）
+- [ ] 计费接口预留（Stripe/微信/支付宝），暂不接入
+
+### M9 — Hardening (planned)
+
+- [ ] P2P 打洞 + 对等认证（替换 dev no-verify TLS）
+- [ ] 冲突合并 GUI（Web 页面对话式合并）
+- [ ] S3 多租户（每用户 bucket prefix）
+- [ ] E2E 密钥轮换 & 按租户密钥
+- [ ] 域池向量库跨机聚合优化
+
+> 优先级：M6（控制 API + 用户系统）→ M7（ygg-admin）→ M8（会员）→ M9（加固）。
