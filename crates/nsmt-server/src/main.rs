@@ -1,6 +1,7 @@
 //! NSMT 服务器 `ygg` — M0：QUIC 监听 + 握手/注册 + 在线注册表 + 广播。
 
 mod admin;
+mod db;
 mod fs;
 mod memory;
 mod registry;
@@ -52,7 +53,7 @@ async fn main() -> anyhow::Result<()> {
     let endpoint =
         quinn::Endpoint::server(server_config, bind).context("bind quinn endpoint")?;
 
-    let state = Arc::new(state::ServerState::new());
+    let state = Arc::new(state::ServerState::new().await);
     let tenants = Arc::new(tenants::TenantStore::load().await);
     tokio::spawn(state.registry.clone().prune_loop());
     tokio::spawn(state.locks.clone().cleanup_loop());

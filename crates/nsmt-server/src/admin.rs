@@ -59,6 +59,9 @@ pub async fn spawn(
         .route("/api/online", get(list_online))
         .route("/api/locks", get(list_locks))
         .route("/api/logs", get(logs))
+        .route("/api/users/register", post(register_user))
+        .route("/api/users/login", post(login_user))
+        .route("/api/tenants/key", post(set_tenant_key))
         .with_state(app_state);
 
     let listener = tokio::net::TcpListener::bind(bind).await?;
@@ -157,4 +160,55 @@ async fn logs(
         Err(e) => return Json(json!({"error": format!("log file {}: {e}", s.log_file.display())})),
     };
     Json(json!({"file": s.log_file.display().to_string(), "lines": lines, "content": content}))
+}
+
+
+// ── M6.2：用户系统（自助注册 / 登录）──
+
+#[derive(Deserialize)]
+struct RegisterReq { username: String, password: String }
+
+async fn register_user(State(s): State<AdminState>, Json(b): Json<RegisterReq>) -> Json<Value> {
+    let Some(db) = &s.state.db else {
+        return Json(json!({"error": "user db not enabled (set NSMT_DB_URL)"}));
+    };
+    let username = b.username.trim().to_string();
+    if username.is_empty() || username.len() > 64 || b.password.len() < 6 {
+        return Json(json!({"error": "username 1-64 chars, password >= 6"}));
+    }
+    match db.register(&username, &b.password).await {
+        Ok(token) => {
+            // 自动创建租户（domain = username；公钥由客户端经 /api/tenants/key 登记）
+            let _ = s.tenants.upsert_tenant(&username, "").await;
+            Json(json!({"ok": true, "token": token, "domain": username, "quota_bytes": crate::db::UserDb::quota_for_plan("free")}))
+        }
+        Err(e) => Json(json!({"error": e})),
+    }
+}
+
+#[derive(Deserialize)]
+struct LoginReq { username: String, password: String }
+
+async fn login_user(State(s): State<AdminState>, Json(b): Json<LoginReq>) -> Json<Value> {
+    let Some(db) = &s.state.db else {
+        return Json(json!({"error": "user db not enabled"}));
+    };
+    match db.login(&b.username, &b.password).await {
+        Ok(token) => Json(json!({"ok": true, "token": token})),
+        Err(e) => Json(json!({"error": e})),
+    }
+}
+
+#[derive(Deserialize)]
+struct SetKeyReq { domain: String, pubkey: String }
+
+/// 自助注册用户登记其客户端域公钥（之后才能通过 AUTH）。
+async fn set_tenant_key(State(s): State<AdminState>, Json(b): Json<SetKeyReq>) -> Json<Value> {
+    if b.pubkey.len() != 64 {
+        return Json(json!({"error": "pubkey must be 64 hex chars"}));
+    }
+    match s.tenants.upsert_tenant(&b.domain, &b.pubkey).await {
+        Ok(()) => Json(json!({"ok": true, "domain": b.domain})),
+        Err(e) => Json(json!({"error": e.to_string()})),
+    }
 }

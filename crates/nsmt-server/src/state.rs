@@ -1,6 +1,7 @@
 //! 服务器共享状态。
 
 pub use crate::fs::LockRegistry;
+pub use crate::db::UserDb;
 pub use crate::memory::MemoryPool;
 pub use crate::registry::Registry;
 use std::sync::Arc;
@@ -11,6 +12,8 @@ pub struct ServerState {
     pub registry: Arc<Registry>,
     pub locks: Arc<LockRegistry>,
     pub pool: MemoryPool,
+    /// 用户数据库（SQLite/MySQL/PG，经 NSMT_DB_URL；可选）。
+    pub db: Option<Arc<UserDb>>,
     /// 按租户缓存的对象存储（内存后端必须跨连接共享）。
     pub object_stores: Arc<tokio::sync::RwLock<std::collections::HashMap<String, Arc<dyn nsmt_fs::ObjectStore>>>>,
     /// 对象 → 上传机器（P2P 路由用）。
@@ -28,22 +31,41 @@ pub fn quota_bytes() -> u64 {
 }
 
 impl ServerState {
-    pub fn new() -> Self {
+    pub async fn new() -> Self {
+        let db = UserDb::connect(std::env::var("NSMT_DB_URL").ok().as_deref())
+            .await
+            .map(Arc::new)
+            .map_err(|e| tracing::warn!("user DB unavailable (NSMT_DB_URL): {e}"))
+            .ok();
         Self {
             registry: Arc::new(Registry::default()),
             locks: Arc::new(LockRegistry::default()),
             pool: crate::memory::pool_from_env(),
+            db,
             object_stores: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
             object_owners: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
             usage_bytes: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
         }
     }
 
+    /// 某租户配额：优先按用户 plan（M6.3），否则全局 env。
+    pub async fn quota_for(&self, user_domain: &str) -> u64 {
+        if let Some(db) = &self.db {
+            match db.plan(user_domain).await {
+                Ok(p) => UserDb::quota_for_plan(&p),
+                Err(_) => UserDb::quota_for_plan("free"),
+            }
+        } else {
+            quota_bytes()
+        }
+    }
+
     /// 检查并预占配额（对象尚未存储时）。超限返回 false。
     pub async fn try_reserve_quota(&self, user_domain: &str, size: u64) -> bool {
+        let limit = self.quota_for(user_domain).await;
         let mut g = self.usage_bytes.write().await;
         let used = g.get(user_domain).copied().unwrap_or(0);
-        if used + size > quota_bytes() {
+        if used + size > limit {
             return false;
         }
         *g.entry(user_domain.to_string()).or_default() += size;

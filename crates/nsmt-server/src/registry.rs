@@ -13,7 +13,7 @@ use tokio::sync::{mpsc, RwLock};
 pub const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
 pub const OFFLINE_AFTER: Duration = Duration::from_secs(30);
 
-fn now_ms() -> u64 {
+pub fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()

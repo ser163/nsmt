@@ -107,8 +107,8 @@
   - [x] `GET /api/online` 在线机器/agent；`GET /api/locks` 锁状态
   - [x] `GET /api/logs?lines=N` 日志 tail（NSMT_LOG_FILE）
   - [x] 控制 API 鉴权（NSMT_ADMIN_TOKEN / x-admin-token）
-- [ ] **M6.2 用户系统**：SQLite `users/sessions/invites/usage`；注册（可选邀请码）→ 登录 → 自动建租户；argon2 密码
-- [ ] **M6.3 配额按用户**：`users.plan` → 默认 50 MB（`NSMT_DEFAULT_QUOTA_BYTES=52428800`），替换全局 env；用量持久化
+- [x] **M6.2 用户系统 ✅**：**通用 SQL 驱动 sqlx Any（SQLite/MySQL/PostgreSQL，`NSMT_DB_URL` 换库即用）**；`users/sessions` 表；注册→登录→自动建租户（domain=username）；argon2 密码；`POST /api/users/register|login`、`POST /api/tenants/key`
+- [x] **M6.3 配额按用户 ✅**：`users.plan`（free=50MB / pro=1GiB）→ `ServerState.quota_for(domain)`；注册响应返回 quota_bytes=52428800；无用户库时回退全局 env
 - [ ] **M6.4 固定记忆**：客户端首次运行把共享目录写入共享记忆（note, key=`nsmt:share_dir`）
 
 ### M7 — ygg-admin (独立监督器 + Web UI) (planned)
