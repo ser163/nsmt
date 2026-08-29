@@ -101,12 +101,12 @@
 
 ### M6 — ygg Control API + User System (进行中 ✅ in progress)
 
-- [ ] **M6.1 ygg 控制 API**（`ygg --control 127.0.0.1:8091`，axum 内嵌 HTTP）：
-  - [ ] `GET /api/status` 服务器健康/uptime/pid/配额/用量
-  - [ ] `GET /api/tenants` 租户列表+用量；`POST /api/tenants` 添加租户（域+公钥）
-  - [ ] `GET /api/online` 在线机器/agent；`GET /api/locks` 锁状态
-  - [ ] `GET /api/logs?lines=N` 日志 tail（NSMT_LOG_FILE）
-  - [ ] 控制 API 鉴权（admin token）
+- [x] **M6.1 ygg 控制 API ✅**（`ygg --control 127.0.0.1:8091`，axum 内嵌 HTTP，2026-08-30 实测通过）：
+  - [x] `GET /api/status` 服务器健康/uptime/pid/配额/用量
+  - [x] `GET /api/tenants` 租户列表+用量；`POST /api/tenants` 添加租户（域+公钥）
+  - [x] `GET /api/online` 在线机器/agent；`GET /api/locks` 锁状态
+  - [x] `GET /api/logs?lines=N` 日志 tail（NSMT_LOG_FILE）
+  - [x] 控制 API 鉴权（NSMT_ADMIN_TOKEN / x-admin-token）
 - [ ] **M6.2 用户系统**：SQLite `users/sessions/invites/usage`；注册（可选邀请码）→ 登录 → 自动建租户；argon2 密码
 - [ ] **M6.3 配额按用户**：`users.plan` → 默认 50 MB（`NSMT_DEFAULT_QUOTA_BYTES=52428800`），替换全局 env；用量持久化
 - [ ] **M6.4 固定记忆**：客户端首次运行把共享目录写入共享记忆（note, key=`nsmt:share_dir`）

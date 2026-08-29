@@ -195,6 +195,12 @@ impl LockRegistry {
         g.get(path).map(|e| e.holder.clone())
     }
 
+    /// 锁快照：`path -> holder`（控制 API 用）。
+    pub async fn snapshot(&self) -> std::collections::HashMap<String, String> {
+        let g = self.locks.read().await;
+        g.iter().map(|(p, e)| (p.clone(), e.holder.clone())).collect()
+    }
+
     /// 定期清理过期锁。
     pub async fn cleanup_loop(self: Arc<Self>) {
         let mut ticker = tokio::time::interval(std::time::Duration::from_secs(10));

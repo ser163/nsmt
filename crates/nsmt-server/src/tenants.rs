@@ -71,6 +71,16 @@ impl TenantStore {
             .map_err(NsmtError::Io)
     }
 
+    /// 租户数量（控制 API 用）。
+    pub async fn count(&self) -> usize {
+        self.inner.read().await.len()
+    }
+
+    /// 全部租户（控制 API 用）。
+    pub async fn all(&self) -> HashMap<String, TenantRecord> {
+        self.inner.read().await.clone()
+    }
+
     /// 添加/更新租户（域公钥）。
     pub async fn upsert_tenant(&self, domain: &str, domain_pubkey: &str) -> Result<(), NsmtError> {
         let mut g = self.inner.write().await;

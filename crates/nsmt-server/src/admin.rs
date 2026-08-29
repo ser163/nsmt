@@ -1,0 +1,160 @@
+//! ygg 控制 API（Web 后台数据面，M6.1）。
+//!
+//! `ygg --control 127.0.0.1:8091` 启用。仅供本机/内网访问；生产建议加 token。
+//! 端点：
+//!   GET  /api/status     健康/uptime/pid/配额/用量
+//!   GET  /api/tenants    租户列表 + 用量；POST 添加租户（域+公钥）
+//!   GET  /api/online     在线机器/agent
+//!   GET  /api/locks      锁状态
+//!   GET  /api/logs?lines=N  日志 tail（NSMT_LOG_FILE）
+
+use crate::state::ServerState;
+use std::sync::Arc as StdArc;
+use crate::tenants::TenantStore;
+use axum::{
+    extract::{Query, State},
+    routing::{get, post},
+    Json, Router,
+};
+use serde::Deserialize;
+use serde_json::{json, Value};
+use std::collections::HashMap;
+use std::sync::Arc;
+
+#[derive(Clone)]
+struct AdminState {
+    state: StdArc<ServerState>,
+    tenants: Arc<TenantStore>,
+    log_file: std::path::PathBuf,
+    started_at: std::time::Instant,
+    admin_token: Option<String>,
+}
+
+/// 启动控制 API 服务器（阻塞运行，放到独立 task）。
+pub async fn spawn(
+    state: StdArc<ServerState>,
+    tenants: Arc<TenantStore>,
+    bind: std::net::SocketAddr,
+) -> anyhow::Result<()> {
+    let log_file = std::env::var("NSMT_LOG_FILE")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| {
+            std::env::var("HOME")
+                .map(|h| std::path::PathBuf::from(h).join(".nsmt/logs/ygg.log"))
+                .unwrap_or_else(|_| std::path::PathBuf::from(".nsmt/logs/ygg.log"))
+        });
+    let admin_token = std::env::var("NSMT_ADMIN_TOKEN").ok().filter(|s| !s.is_empty());
+
+    let app_state = AdminState {
+        state,
+        tenants,
+        log_file,
+        started_at: std::time::Instant::now(),
+        admin_token,
+    };
+
+    let app = Router::new()
+        .route("/api/status", get(status))
+        .route("/api/tenants", get(list_tenants).post(add_tenant))
+        .route("/api/online", get(list_online))
+        .route("/api/locks", get(list_locks))
+        .route("/api/logs", get(logs))
+        .with_state(app_state);
+
+    let listener = tokio::net::TcpListener::bind(bind).await?;
+    tracing::info!("admin control API on http://{bind}");
+    axum::serve(listener, app).await?;
+    Ok(())
+}
+
+/// 简单 token 校验（可选）。
+fn authorized(state: &AdminState, token: Option<&str>) -> bool {
+    match &state.admin_token {
+        Some(t) => token == Some(t.as_str()),
+        None => true,
+    }
+}
+
+async fn status(State(s): State<AdminState>, headers: axum::http::HeaderMap) -> Json<Value> {
+    if !authorized(&s, headers.get("x-admin-token").and_then(|v| v.to_str().ok())) {
+        return Json(json!({"error": "unauthorized"}));
+    }
+    let usage = s.state.usage_bytes.read().await.clone();
+    Json(json!({
+        "status": "ok",
+        "pid": std::process::id(),
+        "uptime_s": s.started_at.elapsed().as_secs(),
+        "tenants": s.tenants.count().await,
+        "usage_bytes": usage,
+        "quota_bytes": crate::state::quota_bytes(),
+    }))
+}
+
+#[derive(Deserialize)]
+struct AddTenant { domain: String, pubkey: String }
+
+async fn add_tenant(
+    State(s): State<AdminState>,
+    headers: axum::http::HeaderMap,
+    Json(body): Json<AddTenant>,
+) -> Json<Value> {
+    if !authorized(&s, headers.get("x-admin-token").and_then(|v| v.to_str().ok())) {
+        return Json(json!({"error": "unauthorized"}));
+    }
+    match s.tenants.upsert_tenant(&body.domain, &body.pubkey).await {
+        Ok(()) => Json(json!({"ok": true, "tenant": body.domain})),
+        Err(e) => Json(json!({"error": e.to_string()})),
+    }
+}
+
+async fn list_tenants(State(s): State<AdminState>, headers: axum::http::HeaderMap) -> Json<Value> {
+    if !authorized(&s, headers.get("x-admin-token").and_then(|v| v.to_str().ok())) {
+        return Json(json!({"error": "unauthorized"}));
+    }
+    let tenants = s.tenants.all().await;
+    let usage = s.state.usage_bytes.read().await.clone();
+    let list: Vec<Value> = tenants
+        .iter()
+        .map(|(domain, rec)| {
+            json!({
+                "domain": domain,
+                "machines": rec.machines.len(),
+                "usage_bytes": usage.get(domain).copied().unwrap_or(0),
+            })
+        })
+        .collect();
+    Json(json!({"tenants": list}))
+}
+
+async fn list_online(State(s): State<AdminState>, headers: axum::http::HeaderMap) -> Json<Value> {
+    if !authorized(&s, headers.get("x-admin-token").and_then(|v| v.to_str().ok())) {
+        return Json(json!({"error": "unauthorized"}));
+    }
+    Json(json!({"online": s.state.registry.all_online().await}))
+}
+
+async fn list_locks(State(s): State<AdminState>, headers: axum::http::HeaderMap) -> Json<Value> {
+    if !authorized(&s, headers.get("x-admin-token").and_then(|v| v.to_str().ok())) {
+        return Json(json!({"error": "unauthorized"}));
+    }
+    Json(json!({"locks": s.state.locks.snapshot().await}))
+}
+
+#[derive(Deserialize)]
+struct LogQuery { lines: Option<usize> }
+
+async fn logs(
+    State(s): State<AdminState>,
+    headers: axum::http::HeaderMap,
+    Query(q): Query<LogQuery>,
+) -> Json<Value> {
+    if !authorized(&s, headers.get("x-admin-token").and_then(|v| v.to_str().ok())) {
+        return Json(json!({"error": "unauthorized"}));
+    }
+    let lines = q.lines.unwrap_or(200).min(5000);
+    let content = match std::fs::read_to_string(&s.log_file) {
+        Ok(c) => c.lines().rev().take(lines).collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>().join("\n"),
+        Err(e) => return Json(json!({"error": format!("log file {}: {e}", s.log_file.display())})),
+    };
+    Json(json!({"file": s.log_file.display().to_string(), "lines": lines, "content": content}))
+}

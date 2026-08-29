@@ -1,5 +1,6 @@
 //! NSMT 服务器 `ygg` — M0：QUIC 监听 + 握手/注册 + 在线注册表 + 广播。
 
+mod admin;
 mod fs;
 mod memory;
 mod registry;
@@ -55,6 +56,24 @@ async fn main() -> anyhow::Result<()> {
     let tenants = Arc::new(tenants::TenantStore::load().await);
     tokio::spawn(state.registry.clone().prune_loop());
     tokio::spawn(state.locks.clone().cleanup_loop());
+
+    // 控制 API：`ygg <addr> --control <ip:port>` 或 NSMT_CONTROL_ADDR
+    let control_addr = std::env::var("NSMT_CONTROL_ADDR").ok().or_else(|| {
+        std::env::args().position(|a| a == "--control").and_then(|i| std::env::args().nth(i + 1))
+    });
+    if let Some(addr) = control_addr {
+        if let Ok(bind) = addr.parse::<SocketAddr>() {
+            let st = state.clone();
+            let tn = tenants.clone();
+            tokio::spawn(async move {
+                if let Err(e) = admin::spawn(st, tn, bind).await {
+                    tracing::error!("admin API exited: {e}");
+                }
+            });
+        } else {
+            tracing::warn!("invalid --control address: {addr}");
+        }
+    }
 
     tracing::info!("ygg listening on {bind} (QUIC)");
 

@@ -150,6 +150,14 @@ impl Registry {
             .cloned()
     }
 
+    /// 全量在线快照：`tenant -> machines`（控制 API 用）。
+    pub async fn all_online(&self) -> std::collections::HashMap<String, Vec<MachineInfo>> {
+        let g = self.inner.read().await;
+        g.iter()
+            .map(|(d, t)| (d.clone(), t.machines.values().cloned().collect()))
+            .collect()
+    }
+
     /// 构造 ONLINE_LIST 帧。
     pub async fn online_list_frame(&self, user_domain: &str) -> Frame {
         let g = self.inner.read().await;
