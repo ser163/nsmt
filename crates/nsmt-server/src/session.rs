@@ -72,6 +72,7 @@ pub async fn handle(conn: quinn::Connection, state: Arc<ServerState>, tenants: A
         agents: vec![reg.agent_tag.clone()],
         addr: conn.remote_address().to_string(),
         peer_addr: reg.peer_addr.clone(),
+        machine_pubkey: reg.machine_pubkey.clone(),
         last_seen: now_ms(),
     };
 
@@ -123,7 +124,7 @@ pub async fn handle(conn: quinn::Connection, state: Arc<ServerState>, tenants: A
                     Ok(Some(frame)) => {
                         if frame.frame_type == FrameType::FileChunk {
                             if let Some(pu) = pending_upload.as_mut() {
-                                handle_chunk(&server_fs, pu, &frame.payload).await?;
+                                handle_chunk(&server_fs, pu, &frame.payload, &user_domain).await?;
                                 if pu.received_count == pu.total_chunks {
                                     if let Some(pu) = pending_upload.take() {
                                         let blob_id = pu.blob_id.clone();
@@ -204,19 +205,24 @@ pub async fn handle(conn: quinn::Connection, state: Arc<ServerState>, tenants: A
                                             Vec::new()
                                         };
                                         let mut payload = (idx as u32).to_le_bytes().to_vec();
-                                        let cipher = nsmt_core::e2e::e2e_key_from_env();
-                                        let enc = nsmt_core::e2e::encrypt_payload(cipher.as_ref(), &chunk, idx)?;
+                                        // M9.4：按租户密钥加密（E2EKeys，支持轮换）
+                                        let e2e = nsmt_core::e2e::E2EKeys::from_env(Some(&user_domain));
+                                        let enc = match &e2e {
+                                            Some(k) => k.encrypt(&chunk, idx)?,
+                                            None => chunk.clone(),
+                                        };
                                         payload.extend_from_slice(&enc);
                                         let mut c = Frame::new(FrameType::FileChunk, 0, payload);
-                                        if cipher.is_some() {
+                                        if e2e.is_some() {
                                             c.flags = nsmt_core::frame::Flags(0x01);
                                         }
                                         fs.send(&c).await?;
                                     }
                                     None => {
                                         // 服务器没有 → 尝试返回持有者 peer 地址（P2P 直连拉取）
-                                        let peer_hint = match state.object_owner(&user_domain, &g.blob_id).await {
-                                            Some(owner) => state.registry.online_machine(&user_domain, &owner).await
+                                        let owner = state.object_owner(&user_domain, &g.blob_id).await;
+                                        let peer_hint = match &owner {
+                                            Some(owner) => state.registry.online_machine(&user_domain, owner).await
                                                 .map(|m| m.peer_addr).unwrap_or_default(),
                                             None => String::new(),
                                         };
@@ -226,6 +232,21 @@ pub async fn handle(conn: quinn::Connection, state: Arc<ServerState>, tenants: A
                                             request_id: None,
                                         };
                                         fs.send_json(FrameType::Error, 0, &e).await?;
+                                        // M9.1 NAT 打洞：通知对象持有者"有人在请求"，持有者主动向
+                                        // requester 外部地址（服务器观测）打洞。
+                                        if let Some(owner) = &owner {
+                                            if owner != &reg.machine_id {
+                                                let hint = nsmt_core::messages::PeerHint {
+                                                    blob_id: g.blob_id.clone(),
+                                                    requester_addr: conn.remote_address().to_string(),
+                                                };
+                                                state.registry.broadcast(
+                                                    &user_domain,
+                                                    Frame::from_json(FrameType::PeerHint, 0, &hint)?,
+                                                )
+                                                .await;
+                                            }
+                                        }
                                     }
                                 }
                             }
@@ -294,7 +315,7 @@ pub async fn handle(conn: quinn::Connection, state: Arc<ServerState>, tenants: A
                 0,
                 &OnlineDelta {
                     kind: OnlineDeltaKind::Leave,
-                    machine: MachineInfo { machine_id: reg.machine_id, agents: Vec::new(), addr: String::new(), peer_addr: String::new(), last_seen: 0 },
+                    machine: MachineInfo { machine_id: reg.machine_id, agents: Vec::new(), addr: String::new(), peer_addr: String::new(), machine_pubkey: String::new(), last_seen: 0 },
                 },
             )?,
         )
@@ -337,6 +358,7 @@ async fn handle_chunk(
     server_fs: &crate::fs::ServerFs,
     pu: &mut PendingUpload,
     payload: &[u8],
+    user_domain: &str,
 ) -> anyhow::Result<()> {
     if payload.len() < 4 {
         return Ok(());
@@ -345,8 +367,11 @@ async fn handle_chunk(
     if idx >= pu.total_chunks || pu.received[idx as usize] {
         return Ok(());
     }
-    let cipher = nsmt_core::e2e::e2e_key_from_env();
-    let data = nsmt_core::e2e::decrypt_payload(cipher.as_ref(), &payload[4..], idx)?;
+    // M9.4：按租户密钥解密（支持轮换：依次尝试全部密钥）
+    let data = match nsmt_core::e2e::E2EKeys::from_env(Some(user_domain)) {
+        Some(k) => k.decrypt(&payload[4..], idx)?,
+        None => payload[4..].to_vec(),
+    };
     std::fs::create_dir_all(pu.temp_path.parent().unwrap_or(std::path::Path::new(".")))?;
     let offset = (idx * nsmt_core::frame::CHUNK_SIZE as u64) as u64;
     use std::io::{Seek, SeekFrom, Write};

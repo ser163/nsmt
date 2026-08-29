@@ -114,13 +114,14 @@ impl ObjectStore for S3ObjectStore {
 
 // ── 内存（测试/开发）──
 
+#[derive(Clone)]
 pub struct MemoryObjectStore {
-    inner: object_store::memory::InMemory,
+    inner: std::sync::Arc<object_store::memory::InMemory>,
 }
 
 impl Default for MemoryObjectStore {
     fn default() -> Self {
-        Self { inner: object_store::memory::InMemory::new() }
+        Self { inner: std::sync::Arc::new(object_store::memory::InMemory::new()) }
     }
 }
 
@@ -151,6 +152,40 @@ fn io_other(e: impl std::fmt::Display) -> std::io::Error {
     std::io::Error::new(std::io::ErrorKind::Other, e.to_string())
 }
 
+/// 给任意后端加 key 前缀（M9.3：S3 多租户，每租户 `t/<domain>/objects/`）。
+#[derive(Clone)]
+pub struct PrefixedObjectStore {
+    inner: std::sync::Arc<dyn ObjectStore>,
+    prefix: String,
+}
+
+impl PrefixedObjectStore {
+    pub fn new(inner: std::sync::Arc<dyn ObjectStore>, prefix: impl Into<String>) -> Self {
+        let p = prefix.into();
+        let p = if p.is_empty() || p.ends_with('/') { p } else { format!("{p}/") };
+        Self { inner, prefix: p }
+    }
+    pub fn key(&self, k: &str) -> String {
+        format!("{}{}", self.prefix, k.trim_start_matches('/'))
+    }
+}
+
+#[async_trait]
+impl ObjectStore for PrefixedObjectStore {
+    async fn put(&self, key: &str, bytes: &[u8]) -> std::io::Result<()> {
+        self.inner.put(&self.key(key), bytes).await
+    }
+    async fn get(&self, key: &str) -> Option<Vec<u8>> {
+        self.inner.get(&self.key(key)).await
+    }
+    async fn exists(&self, key: &str) -> bool {
+        self.inner.exists(&self.key(key)).await
+    }
+    async fn delete(&self, key: &str) -> std::io::Result<()> {
+        self.inner.delete(&self.key(key)).await
+    }
+}
+
 /// 从环境选择后端：`NSMT_OBJECT_STORE=s3` → S3；`memory` → 内存；否则本地。
 pub fn from_env_or(root: std::path::PathBuf) -> Box<dyn ObjectStore> {
     match std::env::var("NSMT_OBJECT_STORE").as_deref() {
@@ -163,6 +198,33 @@ pub fn from_env_or(root: std::path::PathBuf) -> Box<dyn ObjectStore> {
         },
         Ok("memory") => Box::new(MemoryObjectStore::default()),
         _ => Box::new(LocalObjectStore::new(root)),
+    }
+}
+
+/// 按租户取对象存储（M9.3）：本地后端按根目录隔离；S3/内存后端共享底层，
+/// 用 `t/<domain>/objects/` 前缀做租户隔离。
+pub fn from_env_tenant(
+    root: std::path::PathBuf,
+    user_domain: &str,
+) -> Box<dyn ObjectStore> {
+    let base: Box<dyn ObjectStore> = match std::env::var("NSMT_OBJECT_STORE").as_deref() {
+        Ok("s3") => match S3ObjectStore::from_env() {
+            Ok(s) => Box::new(s),
+            Err(e) => {
+                tracing::warn!("S3 backend init failed ({e}); fallback to local");
+                Box::new(LocalObjectStore::new(root))
+            }
+        },
+        Ok("memory") => Box::new(MemoryObjectStore::default()),
+        _ => Box::new(LocalObjectStore::new(root)),
+    };
+    match std::env::var("NSMT_OBJECT_STORE").as_deref() {
+        // 本地后端已按 root（server/<domain>/objects）隔离；共享后端需前缀
+        Ok("s3") | Ok("memory") => Box::new(PrefixedObjectStore::new(
+            std::sync::Arc::from(base),
+            format!("t/{user_domain}/objects"),
+        )),
+        _ => base,
     }
 }
 
@@ -190,5 +252,20 @@ mod tests {
         store.put("k", b"v").await.unwrap();
         assert_eq!(store.get("k").await, Some(b"v".to_vec()));
         assert!(store.exists("k").await);
+    }
+
+    #[tokio::test]
+    async fn prefixed_store_isolates_tenants() {
+        let base = MemoryObjectStore::default();
+        let a = PrefixedObjectStore::new(std::sync::Arc::new(base.clone()), "t/domain-a/objects");
+        let b = PrefixedObjectStore::new(std::sync::Arc::new(base.clone()), "t/domain-b/objects");
+        a.put("obj1", b"aaa").await.unwrap();
+        b.put("obj2", b"bbb").await.unwrap();
+        assert_eq!(a.get("obj1").await, Some(b"aaa".to_vec()));
+        assert_eq!(a.get("obj2").await, None);
+        assert_eq!(b.get("obj2").await, Some(b"bbb".to_vec()));
+        assert_eq!(b.get("obj1").await, None);
+        assert!(a.exists("obj1").await);
+        assert!(!a.exists("obj2").await);
     }
 }

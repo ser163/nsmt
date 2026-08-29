@@ -6,11 +6,28 @@
 //! - 变更：本地对象入库 → 上锁 → 推对象+树；远端变更：diff → 拉取 → 物化
 
 use nsmt_core::frame::{Frame, FrameType};
-use nsmt_core::messages::{FileDiff, FileDiffResult, FileGet, FilePut, FilePutAck, FileTree, FileTreeEntry, LockAcquire, LockRelease};
+use nsmt_core::messages::{FileDiff, FileDiffResult, FileGet, FilePut, FilePutAck, FileTree, FileTreeEntry, LockAcquire, LockRelease, PeerHint};
 use nsmt_core::FrameStream;
 use sha2::{Digest, Sha256};
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
+
+/// M9.1 NAT 打洞钩子：收到服务器 PeerHint（有人在请求本机对象）时，由 main 注册
+/// 一个回调主动向 requester 地址打洞（打开 NAT 映射），之后 requester 直连才通。
+pub static PEER_HINT_HOOK: std::sync::OnceLock<
+    Box<dyn Fn(&str, &str) + Send + Sync>,
+> = std::sync::OnceLock::new();
+
+pub fn maybe_peer_hint(frame: &Frame) {
+    if frame.frame_type != FrameType::PeerHint {
+        return;
+    }
+    if let Ok(h) = frame.payload_json::<PeerHint>() {
+        if let Some(hook) = PEER_HINT_HOOK.get() {
+            hook(&h.blob_id, &h.requester_addr);
+        }
+    }
+}
 
 /// 目录树 hash（与服务器端一致：按路径排序序列化）。
 pub fn tree_hash(tree: &FileTree) -> String {
@@ -224,11 +241,16 @@ where
         let start = (idx * nsmt_core::frame::CHUNK_SIZE as u64) as usize;
         let end = std::cmp::min(start + nsmt_core::frame::CHUNK_SIZE, bytes.len());
         let mut payload = (idx as u32).to_le_bytes().to_vec();
-        let cipher = nsmt_core::e2e::e2e_key_from_env();
-        let enc = nsmt_core::e2e::encrypt_payload(cipher.as_ref(), &bytes[start..end], idx)?;
+        // M9.4：按租户密钥加密（domain = requester FQN 前缀），支持轮换
+        let domain = requester.split('/').next().unwrap_or("");
+        let e2e = nsmt_core::e2e::E2EKeys::from_env(if domain.is_empty() { None } else { Some(domain) });
+        let enc = match &e2e {
+            Some(k) => k.encrypt(&bytes[start..end], idx)?,
+            None => bytes[start..end].to_vec(),
+        };
         payload.extend_from_slice(&enc);
         let mut f = Frame::new(FrameType::FileChunk, 0, payload);
-        if cipher.is_some() {
+        if e2e.is_some() {
             f.flags = nsmt_core::frame::Flags(0x01); // bit0: E2E 加密
         }
         fs.send(&f).await?;
@@ -255,6 +277,7 @@ where
 {
     loop {
         let f = fs.recv().await?.ok_or_else(|| anyhow::anyhow!("eof"))?;
+        maybe_peer_hint(&f);
         if f.frame_type == want {
             return Ok(f);
         }
@@ -285,6 +308,7 @@ where
     fs.send_json(FrameType::FileDiff, 0, &FileDiff { old_tree: old_tree.to_string(), new_tree: None }).await?;
     loop {
         let resp = fs.recv().await?.ok_or_else(|| anyhow::anyhow!("eof"))?;
+        maybe_peer_hint(&resp);
         if resp.frame_type == FrameType::FileDiffResult {
             return Ok(resp.payload_json()?);
         }
@@ -302,7 +326,8 @@ where
 }
 
 /// 分块拉取对象（FILE_GET → FILE_CHUNK，支持断点续传：失败后从已收块继续）。
-pub async fn get_object<R, W>(fs: &mut FrameStream<R, W>, blob_id: &str) -> anyhow::Result<Option<Vec<u8>>>
+/// `domain` 用于派生租户 E2E 密钥（M9.4）。
+pub async fn get_object<R, W>(fs: &mut FrameStream<R, W>, blob_id: &str, domain: &str) -> anyhow::Result<Option<Vec<u8>>>
 where
     R: tokio::io::AsyncRead + Unpin,
     W: tokio::io::AsyncWrite + Unpin,
@@ -313,6 +338,7 @@ where
         fs.send_json(FrameType::FileGet, 0, &FileGet { blob_id: blob_id.to_string(), chunk_index: Some(idx) }).await?;
         let resp = loop {
             let f = fs.recv().await?.ok_or_else(|| anyhow::anyhow!("eof"))?;
+            maybe_peer_hint(&f);
             if f.frame_type == FrameType::FileChunk || f.frame_type == FrameType::Error {
                 break f;
             }
@@ -327,8 +353,11 @@ where
                 if got_idx != idx {
                     continue;
                 }
-                let cipher = nsmt_core::e2e::e2e_key_from_env();
-                let data = nsmt_core::e2e::decrypt_payload(cipher.as_ref(), &resp.payload[4..], idx)?;
+                // M9.4：按租户密钥解密（轮换：尝试全部密钥）
+                let data = match nsmt_core::e2e::E2EKeys::from_env(if domain.is_empty() { None } else { Some(domain) }) {
+                    Some(k) => k.decrypt(&resp.payload[4..], idx)?,
+                    None => resp.payload[4..].to_vec(),
+                };
                 out.extend_from_slice(&data);
                 if data.len() < nsmt_core::frame::CHUNK_SIZE {
                     return Ok(Some(out)); // 最后一块

@@ -41,6 +41,10 @@ pub enum FrameType {
     LockGranted = 0x43,
     LockDenied = 0x44,
     LockNotify = 0x45,
+    PeerHello = 0x50,
+    PeerAuth = 0x51,
+    PeerAuthOk = 0x52,
+    PeerHint = 0x53,
     Error = 0xF0,
 }
 
@@ -73,6 +77,10 @@ impl FrameType {
             0x43 => Self::LockGranted,
             0x44 => Self::LockDenied,
             0x45 => Self::LockNotify,
+            0x50 => Self::PeerHello,
+            0x51 => Self::PeerAuth,
+            0x52 => Self::PeerAuthOk,
+            0x53 => Self::PeerHint,
             0xF0 => Self::Error,
             _ => return None,
         })

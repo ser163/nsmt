@@ -54,6 +54,9 @@ pub struct MachineInfo {
     /// P2P 直连地址（客户端监听），为空则不可直连。
     #[serde(default)]
     pub peer_addr: String,
+    /// 机器公钥（hex，Ed25519）——P2P 对等认证用（M9.1）。
+    #[serde(default)]
+    pub machine_pubkey: String,
     pub last_seen: u64,
 }
 
@@ -241,6 +244,41 @@ pub struct LockNotify {
     pub path: String,
     pub event: String,
     pub holder: Option<String>,
+}
+
+// ── P2P 对等认证 / 打洞（M9.1）──
+
+/// P2P 连接建立后的对等认证第一步：发起方自报身份。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PeerHello {
+    pub user_domain: String,
+    pub machine_id: String,
+    pub agent_tag: String,
+    pub machine_pubkey: String,
+}
+
+/// 对等认证第二步：对端下发 nonce，要求发起方用域密钥签名。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PeerAuth {
+    pub nonce: String,
+}
+
+/// 对等认证第三步：发起方回签名（域密钥，同一用户域共享）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PeerAuthOk {
+    pub machine_id: String,
+    pub agent_tag: String,
+    pub machine_pubkey: String,
+    /// 对 nonce 的域密钥签名（hex）。
+    pub signature: String,
+}
+
+/// 服务器 → owner：有人请求本机拥有的对象，提示主动打洞（NAT hole punching）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PeerHint {
+    pub blob_id: String,
+    /// requester 的外部地址（服务器观测），owner 主动直连目标。
+    pub requester_addr: String,
 }
 
 // ── 错误 ──

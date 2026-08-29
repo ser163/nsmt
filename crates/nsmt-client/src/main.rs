@@ -8,6 +8,7 @@
 //! 环境变量：NSMT_USER_DOMAIN / NSMT_AGENT_TAG / NSMT_MACHINE_ID（测试覆盖）/
 //!           NSMT_SHARE_DIR / NSMT_OBJECTS_DIR / NSMT_SYMLINK_VIEW
 
+mod conflicts_web;
 mod fs;
 mod memory;
 
@@ -29,6 +30,17 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 fn now_ms() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64
+}
+
+/// P2P 对等认证上下文（M9.1）：本机身份 + 密钥。
+#[derive(Clone)]
+struct PeerCtx {
+    domain: String,
+    machine_id: String,
+    agent_tag: String,
+    machine_pubkey: String,
+    machine_key: KeyPair,
+    domain_key: KeyPair,
 }
 
 #[tokio::main]
@@ -57,16 +69,41 @@ async fn main() -> anyhow::Result<()> {
 
     let command = args.get(2).map(|s| s.as_str());
 
-    // 冲突合并 CLI（无需服务器连接）
+    // 冲突合并 CLI / Web GUI（无需服务器连接）
     if command == Some("conflicts") || command == Some("merge") {
         return conflicts_cli(&args).await;
+    }
+    if command == Some("conflicts-web") {
+        let port: u16 = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(8088);
+        let bind = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+        return conflicts_web::serve(bind).await;
     }
 
     let conn = connect(server_addr).await?;
     tracing::info!("QUIC connected to {server_addr}");
     let (send, recv) = conn.open_bi().await?;
     let mut fs = FrameStream::new(recv, send);
-    let peer_addr = start_peer_listener().await?;
+    // M9.1 P2P 对等认证上下文
+    let peer_ctx = PeerCtx {
+        domain: user_domain.clone(),
+        machine_id: machine_id.clone(),
+        agent_tag: agent.clone(),
+        machine_pubkey: machine_key.public_hex(),
+        machine_key: machine_key.clone(),
+        domain_key: domain_key.clone(),
+    };
+    // 注册 NAT 打洞钩子：本地持有该对象 → 主动向 requester 打洞
+    let _ = fs::PEER_HINT_HOOK.set(Box::new(|blob_id: &str, addr: &str| {
+        if fs::objects_dir().join(blob_id).exists() {
+            let addr = addr.to_string();
+            tokio::spawn(async move {
+                if let Err(e) = hole_punch(&addr).await {
+                    tracing::debug!("hole punch to {addr}: {e}");
+                }
+            });
+        }
+    }));
+    let peer_addr = start_peer_listener(peer_ctx.clone()).await?;
     handshake(&mut fs, &user_domain, &agent, &machine_id, &peer_addr, &domain_key, &machine_key).await?;
 
     // M6.4 固定记忆：首启把共享目录写入共享记忆（域池，note key=nsmt:share_dir）+ 本地托底（双写），
@@ -90,7 +127,7 @@ async fn main() -> anyhow::Result<()> {
             recall(&mut fs, &fallback, &query).await?;
         }
         Some("fs") => {
-            fs_mode(&mut fs, &fqn).await?;
+            fs_mode(&mut fs, &fqn, &peer_ctx).await?;
         }
         _ => {
             online_mode(&mut fs, &fqn).await?;
@@ -237,7 +274,7 @@ fn print_results(source: &str, memories: &[nsmt_core::messages::MemoryHit]) {
 
 // ── M2：共享文件同步 ──
 
-async fn fs_mode<R, W>(fs: &mut FrameStream<R, W>, fqn: &str) -> anyhow::Result<()>
+async fn fs_mode<R, W>(fs: &mut FrameStream<R, W>, fqn: &str, peer_ctx: &PeerCtx) -> anyhow::Result<()>
 where
     R: tokio::io::AsyncRead + Unpin,
     W: tokio::io::AsyncWrite + Unpin,
@@ -247,9 +284,29 @@ where
     tracing::info!("share dir: {}", dir.display());
 
     let mut local_tree = fs::build_tree(&dir)?;
-    // 首次：本地对象入库 + 推对象 + 推树
+    // 首次：先与服务器对齐（先拉后推，避免空目录覆盖共享树）
+    if let Ok(diff) = fs::request_diff(fs, &local_tree.tree_hash).await {
+        if let Some(remote_tree) = &diff.tree {
+            for p in &diff.changed {
+                if let Some(e) = remote_tree.entries.iter().find(|e| &e.path == p) {
+                    tracing::info!("[init-pull] get_object {}", e.blob_id);
+                    if let Some(bytes) = pull_object_with_peer(fs, e, fqn, peer_ctx).await? {
+                        fs::materialize_with_conflict(e, &bytes, fqn)?;
+                        fs::ensure_object_local(&e.blob_id, &bytes)?;
+                    }
+                }
+            }
+            for p in &diff.removed {
+                let _ = std::fs::remove_file(dir.join(p));
+            }
+        }
+        if let Ok(t) = fs::build_tree(&dir) {
+            local_tree = t;
+        }
+    }
+    // 推送合并后的本地树（含新增对象）
     sync_push(fs, &local_tree, fqn).await?;
-    tracing::info!("initial push done: {} entries, tree={}", local_tree.entries.len(), local_tree.tree_hash);
+    tracing::info!("initial sync done: {} entries, tree={}", local_tree.entries.len(), local_tree.tree_hash);
 
     // 文件监听
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<()>();
@@ -288,21 +345,7 @@ where
                             for p in &diff.changed {
                                 if let Some(e) = remote_tree.entries.iter().find(|e| &e.path == p) {
                                     tracing::info!("[pull] get_object {}", e.blob_id);
-                                    let mut got = fs::get_object(fs, &e.blob_id).await?;
-                                    tracing::info!("[pull] get_object done: {:?}", got.is_some());
-                                    if got.is_none() {
-                                        tracing::info!("[pull] server miss -> peer hint...");
-                                        if let Some(peer) = peer_addr_hint(fs, &e.blob_id).await? {
-                                            tracing::info!("[pull] peer hint = {peer}, connecting...");
-                                            match fetch_from_peer(&peer, &e.blob_id).await {
-                                                Ok(Some(b)) => { tracing::info!("[pull] peer fetch OK {} bytes", b.len()); got = Some(b); }
-                                                Ok(None) => tracing::warn!("[pull] peer has no object"),
-                                                Err(e) => tracing::warn!("[pull] peer fetch failed: {e}"),
-                                            }
-                                        } else {
-                                            tracing::warn!("[pull] no peer hint");
-                                        }
-                                    }
+                                    let got = pull_object_with_peer(fs, e, fqn, peer_ctx).await?;
                                     if let Some(bytes) = got {
                                         fs::materialize_with_conflict(e, &bytes, fqn)?;
                                         fs::ensure_object_local(&e.blob_id, &bytes)?;
@@ -321,6 +364,36 @@ where
             }
         }
     }
+}
+
+/// 拉取一个对象：先服务器，miss 则 peer hint + 直连（M9.1 对等认证 + 打洞）。
+async fn pull_object_with_peer<R, W>(
+    fs: &mut FrameStream<R, W>,
+    e: &nsmt_core::messages::FileTreeEntry,
+    fqn: &str,
+    peer_ctx: &PeerCtx,
+) -> anyhow::Result<Option<Vec<u8>>>
+where
+    R: tokio::io::AsyncRead + Unpin,
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    let user_domain = fqn.split('/').next().unwrap_or("");
+    if let Some(bytes) = fs::get_object(fs, &e.blob_id, user_domain).await? {
+        tracing::info!("[pull] get_object done: {} bytes", bytes.len());
+        return Ok(Some(bytes));
+    }
+    tracing::info!("[pull] server miss -> peer hint...");
+    if let Some(peer) = peer_addr_hint(fs, &e.blob_id).await? {
+        tracing::info!("[pull] peer hint = {peer}, connecting...");
+        match fetch_from_peer(&peer, &e.blob_id, peer_ctx).await {
+            Ok(Some(b)) => { tracing::info!("[pull] peer fetch OK {} bytes", b.len()); return Ok(Some(b)); }
+            Ok(None) => tracing::warn!("[pull] peer has no object"),
+            Err(err) => tracing::warn!("[pull] peer fetch failed: {err}"),
+        }
+    } else {
+        tracing::warn!("[pull] no peer hint");
+    }
+    Ok(None)
 }
 
 async fn sync_push<R, W>(fs: &mut FrameStream<R, W>, tree: &FileTree, fqn: &str) -> anyhow::Result<()>
@@ -397,6 +470,7 @@ where
     fs.send_json(FT::FileGet, 0, &FileGet { blob_id: blob_id.to_string(), chunk_index: Some(0) }).await?;
     loop {
         let f = fs.recv().await?.ok_or_else(|| anyhow::anyhow!("eof"))?;
+        fs::maybe_peer_hint(&f);
         match f.frame_type {
             FT::FileChunk => return Ok(None), // 服务器有对象
             FT::Error => {
@@ -411,9 +485,104 @@ where
     }
 }
 
-/// 从对端 peer 直连拉取对象（dev：不校验对端证书）。
-async fn fetch_from_peer(peer_addr: &str, blob_id: &str) -> anyhow::Result<Option<Vec<u8>>> {
+/// P2P 对等认证（M9.1）：发起方用域密钥签 nonce，对端用本机域公钥验证。
+/// 返回对方 `(machine_id, machine_pubkey)`，验证失败返回 Err。
+async fn peer_authenticate<R, W>(
+    fs: &mut FrameStream<R, W>,
+    ctx: &PeerCtx,
+    is_initiator: bool,
+) -> anyhow::Result<(String, String)>
+where
+    R: tokio::io::AsyncRead + Unpin,
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    if is_initiator {
+        // A → B: PeerHello（自报身份）
+        fs.send_json(FT::PeerHello, 0, &nsmt_core::messages::PeerHello {
+            user_domain: ctx.domain.clone(),
+            machine_id: ctx.machine_id.clone(),
+            agent_tag: ctx.agent_tag.clone(),
+            machine_pubkey: ctx.machine_pubkey.clone(),
+        }).await?;
+        // B → A: PeerAuth { nonce }
+        let auth: nsmt_core::messages::PeerAuth = recv_until(fs, FT::PeerAuth).await?.payload_json()?;
+        // A → B: PeerAuthOk（域密钥签名）
+        let sig = ctx.domain_key.sign(auth.nonce.as_bytes());
+        fs.send_json(FT::PeerAuthOk, 0, &nsmt_core::messages::PeerAuthOk {
+            machine_id: ctx.machine_id.clone(),
+            agent_tag: ctx.agent_tag.clone(),
+            machine_pubkey: ctx.machine_pubkey.clone(),
+            signature: sig,
+        }).await?;
+        // B → A: 确认（B 也签名同一 nonce，供 A 验证 B 身份）
+        let ok: nsmt_core::messages::PeerAuthOk = recv_until(fs, FT::PeerAuthOk).await?.payload_json()?;
+        if !KeyPair::verify(&ctx.domain_key.public_hex(), auth.nonce.as_bytes(), &ok.signature) {
+            anyhow::bail!("peer auth failed: bad responder signature");
+        }
+        Ok((ok.machine_id, ok.machine_pubkey))
+    } else {
+        // B 侧：收 PeerHello → 发 PeerAuth → 收 PeerAuthOk → 验证
+        let hello: nsmt_core::messages::PeerHello = recv_until(fs, FT::PeerHello).await?.payload_json()?;
+        if hello.user_domain != ctx.domain {
+            anyhow::bail!("peer auth failed: domain mismatch ({} != {})", hello.user_domain, ctx.domain);
+        }
+        let nonce = format!("nsmt-peer-{}-{}", now_ms(), hello.machine_id);
+        fs.send_json(FT::PeerAuth, 0, &nsmt_core::messages::PeerAuth { nonce: nonce.clone() }).await?;
+        let ok: nsmt_core::messages::PeerAuthOk = recv_until(fs, FT::PeerAuthOk).await?.payload_json()?;
+        // 用域公钥验证（同域共享 domain key；对端机器公钥只作记录）
+        if !KeyPair::verify(&ctx.domain_key.public_hex(), nonce.as_bytes(), &ok.signature) {
+            anyhow::bail!("peer auth failed: bad signature");
+        }
+        // B → A：确认（B 签名同一 nonce，供发起方验证）
+        let sig = ctx.domain_key.sign(nonce.as_bytes());
+        fs.send_json(FT::PeerAuthOk, 0, &nsmt_core::messages::PeerAuthOk {
+            machine_id: ctx.machine_id.clone(),
+            agent_tag: ctx.agent_tag.clone(),
+            machine_pubkey: ctx.machine_pubkey.clone(),
+            signature: sig,
+        }).await?;
+        Ok((hello.machine_id, hello.machine_pubkey))
+    }
+}
+
+async fn recv_until<R, W>(fs: &mut FrameStream<R, W>, want: FT) -> anyhow::Result<nsmt_core::frame::Frame>
+where
+    R: tokio::io::AsyncRead + Unpin,
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    loop {
+        let f = fs.recv().await?.ok_or_else(|| anyhow::anyhow!("eof"))?;
+        fs::maybe_peer_hint(&f);
+        if f.frame_type == want {
+            return Ok(f);
+        }
+    }
+}
+
+/// 从对端 peer 直连拉取对象（M9.1：应用层对等认证，替换 no-verify TLS 作为信任基础）。
+async fn fetch_from_peer(peer_addr: &str, blob_id: &str, ctx: &PeerCtx) -> anyhow::Result<Option<Vec<u8>>> {
     let addr: SocketAddr = peer_addr.parse().context("bad peer addr")?;
+    let mut conn = connect_peer_client(addr).await?;
+    let (send, recv) = conn.open_bi().await?;
+    let mut fs = FrameStream::new(recv, send);
+    // 对等认证（发起方）
+    peer_authenticate(&mut fs, ctx, true).await?;
+    tracing::debug!("peer authenticated: {peer_addr}");
+    fs::get_object(&mut fs, blob_id, &ctx.domain).await
+}
+
+/// 打洞连接（M9.1）：向 requester 外部地址发起 QUIC 连接，打开 NAT 映射后即关闭。
+/// 目的是让双方 NAT 都记录对方的映射，之后直连才通。
+async fn hole_punch(requester_addr: &str) -> anyhow::Result<()> {
+    let addr: SocketAddr = requester_addr.parse().context("bad hole punch addr")?;
+    let conn = connect_peer_client(addr).await?;
+    // 打开一条流即关闭（触发 UDP 出向包，建立 NAT 映射）
+    let _ = conn.open_bi().await?;
+    Ok(())
+}
+
+/// 创建 P2P 客户端连接（dev：TLS 自签不验证，信任交给应用层对等认证）。
+async fn connect_peer_client(addr: SocketAddr) -> anyhow::Result<quinn::Connection> {
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     let rustls_client = rustls::ClientConfig::builder()
         .dangerous()
@@ -423,14 +592,11 @@ async fn fetch_from_peer(peer_addr: &str, blob_id: &str) -> anyhow::Result<Optio
         quinn::crypto::rustls::QuicClientConfig::try_from(rustls_client)?,
     ));
     let endpoint = quinn::Endpoint::client("0.0.0.0:0".parse()?)?;
-    let conn = endpoint.connect_with(client_config, addr, "localhost").context("peer connect")?.await?;
-    let (send, recv) = conn.open_bi().await?;
-    let mut fs = FrameStream::new(recv, send);
-    fs::get_object(&mut fs, blob_id).await
+    Ok(endpoint.connect_with(client_config, addr, "localhost").context("peer connect")?.await?)
 }
 
-/// 启动 P2P 监听器（服务 FILE_GET），返回本机 peer 地址。
-async fn start_peer_listener() -> anyhow::Result<String> {
+/// 启动 P2P 监听器（服务 FILE_GET，M9.1 先对等认证），返回本机 peer 地址。
+async fn start_peer_listener(ctx: PeerCtx) -> anyhow::Result<String> {
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     let key = rcgen::KeyPair::generate().context("rcgen key")?;
     let params = rcgen::CertificateParams::new(vec!["localhost".to_string()]).context("params")?;
@@ -452,9 +618,10 @@ async fn start_peer_listener() -> anyhow::Result<String> {
     let local = endpoint.local_addr()?;
     tokio::spawn(async move {
         while let Some(conn) = endpoint.accept().await {
+            let ctx = ctx.clone();
             tokio::spawn(async move {
                 if let Ok(c) = conn.await {
-                    let _ = serve_peer(c).await;
+                    let _ = serve_peer(c, ctx).await;
                 }
             });
         }
@@ -463,10 +630,19 @@ async fn start_peer_listener() -> anyhow::Result<String> {
     Ok(local.to_string())
 }
 
-/// 对等节点服务：只处理 FILE_GET → FILE_CHUNK。
-async fn serve_peer(conn: quinn::Connection) -> anyhow::Result<()> {
+/// 对等节点服务：先对等认证（M9.1），再处理 FILE_GET → FILE_CHUNK。
+async fn serve_peer(conn: quinn::Connection, ctx: PeerCtx) -> anyhow::Result<()> {
     let (send, recv) = conn.accept_bi().await?;
     let mut fs = FrameStream::new(recv, send);
+    // 对等认证（响应方）：失败即断开，不打洞连接也通过（打洞连接随后关闭）
+    let peer = match peer_authenticate(&mut fs, &ctx, false).await {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::debug!("peer auth rejected: {e}");
+            return Ok(());
+        }
+    };
+    tracing::debug!("peer {} authenticated", peer.0);
     loop {
         match fs.recv().await? {
             Some(f) if f.frame_type == FT::FileGet => {
@@ -481,8 +657,18 @@ async fn serve_peer(conn: quinn::Connection) -> anyhow::Result<()> {
                         Vec::new()
                     };
                     let mut payload = (idx as u32).to_le_bytes().to_vec();
-                    payload.extend_from_slice(&chunk);
-                    fs.send(&Frame::new(FT::FileChunk, 0, payload)).await?;
+                    // M9.4：按租户密钥加密响应
+                    let e2e = nsmt_core::e2e::E2EKeys::from_env(Some(&ctx.domain));
+                    let enc = match &e2e {
+                        Some(k) => k.encrypt(&chunk, idx)?,
+                        None => chunk.clone(),
+                    };
+                    payload.extend_from_slice(&enc);
+                    let mut f = Frame::new(FT::FileChunk, 0, payload);
+                    if e2e.is_some() {
+                        f.flags = nsmt_core::frame::Flags(0x01);
+                    }
+                    fs.send(&f).await?;
                 } else {
                     let e = nsmt_core::messages::ErrorMsg { code: "0xE020".into(), message: "object not found".into(), request_id: None };
                     fs.send_json(FT::Error, 0, &e).await?;

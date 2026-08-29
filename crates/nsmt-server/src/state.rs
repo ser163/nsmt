@@ -84,14 +84,14 @@ impl ServerState {
         g.get(user_domain).and_then(|m| m.get(blob_id)).cloned()
     }
 
-    /// 取（或创建）某租户的对象存储。
+    /// 取（或创建）某租户的对象存储（M9.3：S3/内存共享后端按租户前缀隔离）。
     pub async fn object_store_for(&self, user_domain: &str, base: &std::path::Path) -> Arc<dyn nsmt_fs::ObjectStore> {
         let mut g = self.object_stores.write().await;
         if let Some(s) = g.get(user_domain) {
             return s.clone();
         }
         let root = base.join("server").join(sanitize_domain(user_domain)).join("objects");
-        let store: Arc<dyn nsmt_fs::ObjectStore> = Arc::from(nsmt_fs::from_env_or(root));
+        let store: Arc<dyn nsmt_fs::ObjectStore> = Arc::from(nsmt_fs::from_env_tenant(root, user_domain));
         g.insert(user_domain.to_string(), store.clone());
         store
     }
