@@ -6,7 +6,7 @@
 //! - 变更：本地对象入库 → 上锁 → 推对象+树；远端变更：diff → 拉取 → 物化
 
 use nsmt_core::frame::{Frame, FrameType};
-use nsmt_core::messages::{FileDiff, FileDiffResult, FileGet, FilePut, FileTree, FileTreeEntry, LockAcquire, LockRelease};
+use nsmt_core::messages::{FileDiff, FileDiffResult, FileGet, FilePut, FilePutAck, FileTree, FileTreeEntry, LockAcquire, LockRelease};
 use nsmt_core::FrameStream;
 use sha2::{Digest, Sha256};
 use std::io::Write as _;
@@ -194,17 +194,54 @@ where
     let bytes = if obj_path.exists() {
         std::fs::read(&obj_path)?
     } else {
-        // 从共享目录读
         std::fs::read(share_dir().join(&entry.path))?
     };
 
-    // 推对象
-    fs.send_json(FrameType::FilePut, 0, &FilePut { blob_id: entry.blob_id.clone(), total_chunks: 1, size: bytes.len() as u64 }).await?;
-    fs.send(&Frame::new(FrameType::FileChunk, 0, bytes)).await?;
+    // 分块上传（断点续传：按 FilePutAck.have 只传缺失块）
+    let total_chunks = bytes.len().div_ceil(nsmt_core::frame::CHUNK_SIZE) as u64;
+    fs.send_json(FrameType::FilePut, 0, &FilePut {
+        blob_id: entry.blob_id.clone(),
+        total_chunks,
+        size: bytes.len() as u64,
+    }).await?;
+    // 读初始 ack（已拥有块列表）
+    let ack: FilePutAck = read_until(fs, FrameType::FilePutAck).await?.payload_json()?;
+    for idx in 0..total_chunks {
+        if ack.have.contains(&idx) {
+            continue; // 已传过（续传）
+        }
+        let start = (idx * nsmt_core::frame::CHUNK_SIZE as u64) as usize;
+        let end = std::cmp::min(start + nsmt_core::frame::CHUNK_SIZE, bytes.len());
+        let mut payload = (idx as u32).to_le_bytes().to_vec();
+        payload.extend_from_slice(&bytes[start..end]);
+        fs.send(&Frame::new(FrameType::FileChunk, 0, payload)).await?;
+    }
+    // 读完成 ack
+    let done: FilePutAck = read_until(fs, FrameType::FilePutAck).await?.payload_json()?;
+    if !done.completed {
+        tracing::warn!("upload not completed for {}", entry.blob_id);
+    }
 
     // 释放锁
     fs.send_json(FrameType::LockRelease, 0, &LockRelease { path: entry.path.clone(), requester: requester.to_string() }).await?;
     Ok(())
+}
+
+/// 循环读帧直到出现目标类型（跳过广播帧）。
+async fn read_until<R, W>(
+    fs: &mut FrameStream<R, W>,
+    want: FrameType,
+) -> anyhow::Result<Frame>
+where
+    R: tokio::io::AsyncRead + Unpin,
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    loop {
+        let f = fs.recv().await?.ok_or_else(|| anyhow::anyhow!("eof"))?;
+        if f.frame_type == want {
+            return Ok(f);
+        }
+    }
 }
 
 /// 拉取一个对象（FileGet → FileChunk）并物化。
@@ -247,19 +284,41 @@ where
     Ok(())
 }
 
-/// 拉取对象（FILE_GET → FILE_CHUNK）。
+/// 分块拉取对象（FILE_GET → FILE_CHUNK，支持断点续传：失败后从已收块继续）。
 pub async fn get_object<R, W>(fs: &mut FrameStream<R, W>, blob_id: &str) -> anyhow::Result<Option<Vec<u8>>>
 where
     R: tokio::io::AsyncRead + Unpin,
     W: tokio::io::AsyncWrite + Unpin,
 {
-    fs.send_json(FrameType::FileGet, 0, &FileGet { blob_id: blob_id.to_string(), chunk_index: None }).await?;
+    let mut out = Vec::new();
+    let mut idx: u64 = 0;
     loop {
-        let resp = fs.recv().await?.ok_or_else(|| anyhow::anyhow!("eof"))?;
+        fs.send_json(FrameType::FileGet, 0, &FileGet { blob_id: blob_id.to_string(), chunk_index: Some(idx) }).await?;
+        let resp = loop {
+            let f = fs.recv().await?.ok_or_else(|| anyhow::anyhow!("eof"))?;
+            if f.frame_type == FrameType::FileChunk || f.frame_type == FrameType::Error {
+                break f;
+            }
+        };
         match resp.frame_type {
-            FrameType::FileChunk => return Ok(Some(resp.payload)),
             FrameType::Error => return Ok(None),
-            _ => { /* 广播帧，忽略 */ }
+            FrameType::FileChunk => {
+                if resp.payload.len() < 4 {
+                    return Ok(Some(out));
+                }
+                let got_idx = u32::from_le_bytes([resp.payload[0], resp.payload[1], resp.payload[2], resp.payload[3]]) as u64;
+                let data = &resp.payload[4..];
+                if got_idx != idx {
+                    // 服务器返回了别的块？忽略（或按序重试）
+                    continue;
+                }
+                out.extend_from_slice(data);
+                if data.len() < nsmt_core::frame::CHUNK_SIZE {
+                    return Ok(Some(out)); // 最后一块
+                }
+                idx += 1;
+            }
+            _ => unreachable!(),
         }
     }
 }

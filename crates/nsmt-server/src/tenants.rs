@@ -118,8 +118,7 @@ impl TenantStore {
         } else {
             t.machines.insert(machine_id.to_string(), machine_pubkey.to_string());
         }
-        drop(g);
-        let _ = self.persist();
+        // 机器表只在内存维护（避免多进程陈旧表覆盖磁盘）；域公钥由 admin 持久化
         Ok(())
     }
 }

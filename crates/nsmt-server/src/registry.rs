@@ -142,6 +142,14 @@ impl Registry {
         }
     }
 
+    /// 查某机器在线信息。
+    pub async fn online_machine(&self, user_domain: &str, machine_id: &str) -> Option<MachineInfo> {
+        let g = self.inner.read().await;
+        g.get(user_domain)
+            .and_then(|t| t.machines.get(machine_id))
+            .cloned()
+    }
+
     /// 构造 ONLINE_LIST 帧。
     pub async fn online_list_frame(&self, user_domain: &str) -> Frame {
         let g = self.inner.read().await;

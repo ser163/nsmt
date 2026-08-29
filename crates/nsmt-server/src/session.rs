@@ -8,7 +8,7 @@ use crate::state::ServerState;
 use crate::tenants::TenantStore;
 use nsmt_core::frame::{Frame, FrameType};
 use nsmt_core::messages::{
-    Auth, FileDiff, FileDiffResult, FileGet, FilePut, FileTree, Hello, HelloAck, LockAcquire,
+    Auth, FileDiff, FileDiffResult, FileGet, FilePut, FilePutAck, FileTree, Hello, HelloAck, LockAcquire,
     LockDenied, LockGranted, LockNotify, LockRelease, LockRenew, MachineInfo, MemoryCapture,
     MemoryCaptureResult, MemoryRecall, MemoryRecallResult, OnlineDelta, OnlineDeltaKind, Register,
     RegisterAck,
@@ -71,6 +71,7 @@ pub async fn handle(conn: quinn::Connection, state: Arc<ServerState>, tenants: A
         machine_id: reg.machine_id.clone(),
         agents: vec![reg.agent_tag.clone()],
         addr: conn.remote_address().to_string(),
+        peer_addr: reg.peer_addr.clone(),
         last_seen: now_ms(),
     };
 
@@ -92,12 +93,12 @@ pub async fn handle(conn: quinn::Connection, state: Arc<ServerState>, tenants: A
         .await;
 
     // 租户文件存储
-    let server_fs = ServerFs::new(
-        std::path::Path::new(&std::env::var("NSMT_HOME").unwrap_or_else(|_| {
-            std::env::var("HOME").unwrap_or_else(|_| ".".into())
-        })),
-        &user_domain,
-    );
+    let nsmt_home = std::env::var("NSMT_HOME").unwrap_or_else(|_| {
+        std::env::var("HOME").map(|h| format!("{h}/.nsmt")).unwrap_or_else(|_| ".nsmt".into())
+    });
+    let nsmt_home_path = std::path::PathBuf::from(&nsmt_home);
+    let objects = state.object_store_for(&user_domain, &nsmt_home_path).await;
+    let server_fs = ServerFs::new(&nsmt_home_path, &user_domain, objects);
 
     tracing::info!("machine registered: {} @ {} (agents={})", reg.machine_id, user_domain, reg.agent_tag);
 
@@ -105,8 +106,8 @@ pub async fn handle(conn: quinn::Connection, state: Arc<ServerState>, tenants: A
     let mut heartbeat = tokio::time::interval(crate::registry::HEARTBEAT_INTERVAL);
     heartbeat.tick().await;
 
-    // 文件上传缓冲（FILE_PUT 后跟 FILE_CHUNK）
-    let mut pending_put: Option<FilePut> = None;
+    // 文件上传缓冲（FILE_PUT → FilePutAck → FILE_CHUNK 分块 → 完成）
+    let mut pending_upload: Option<PendingUpload> = None;
 
     loop {
         tokio::select! {
@@ -120,10 +121,23 @@ pub async fn handle(conn: quinn::Connection, state: Arc<ServerState>, tenants: A
             got = fs.recv() => {
                 match got {
                     Ok(Some(frame)) => {
-                        if let Some(fp) = pending_put.take() {
-                            // 收到对象数据
-                            server_fs.put_object(&fp.blob_id, &frame.payload)?;
-                            tracing::debug!("object stored: {}", fp.blob_id);
+                        if frame.frame_type == FrameType::FileChunk {
+                            if let Some(pu) = pending_upload.as_mut() {
+                                handle_chunk(&server_fs, pu, &frame.payload).await?;
+                                if pu.received_count == pu.total_chunks {
+                                    if let Some(pu) = pending_upload.take() {
+                                        let blob_id = pu.blob_id.clone();
+                                        let bytes = std::fs::read(&pu.temp_path)?;
+                                        server_fs.put_object(&blob_id, &bytes).await?;
+                                        let _ = std::fs::remove_file(&pu.temp_path);
+                                        state.record_object_owner(&user_domain, &blob_id, &reg.machine_id).await;
+                                        tracing::debug!("object stored (chunked): {}", blob_id);
+                                        fs.send_json(FrameType::FilePutAck, 0, &FilePutAck {
+                                            blob_id, have: (0..pu.total_chunks).collect(), completed: true,
+                                        }).await?;
+                                    }
+                                }
+                            }
                             continue;
                         }
                         match frame.frame_type {
@@ -163,29 +177,47 @@ pub async fn handle(conn: quinn::Connection, state: Arc<ServerState>, tenants: A
                             }
                             FrameType::FileTree => {
                                 let mut tree: FileTree = frame.payload_json()?;
+                                let client_hash = tree.tree_hash.clone();
                                 tree.tree_hash = tree_hash(&tree);
+                                tracing::info!("tree recv: client={} recomputed={} entries={}", &client_hash[..12], &tree.tree_hash[..12], tree.entries.len());
                                 server_fs.save_tree(&tree)?;
                                 tracing::info!("tree updated: {} entries={}", tree.tree_hash, tree.entries.len());
                             }
                             FrameType::FileDiff => {
                                 let diff: FileDiff = frame.payload_json()?;
-                                let old = diff.new_tree.as_ref().and_then(|h| server_fs.get_tree(h));
+                                let old = server_fs.get_tree(&diff.old_tree);
                                 let latest = server_fs.latest_tree();
                                 let (changed, removed) = ServerFs::diff(old.as_ref(), latest.as_ref());
+                                tracing::info!("diff: old={:?} latest={:?} changed={:?} removed={:?}", old.as_ref().map(|t|&t.tree_hash[..12]), latest.as_ref().map(|t|&t.tree_hash[..12]), changed, removed);
                                 let resp = FileDiffResult { changed, removed, tree: latest };
                                 fs.send_json(FrameType::FileDiffResult, 0, &resp).await?;
                             }
                             FrameType::FileGet => {
                                 let g: FileGet = frame.payload_json()?;
-                                match server_fs.get_object(&g.blob_id) {
+                                match server_fs.get_object(&g.blob_id).await {
                                     Some(data) => {
-                                        let c = Frame::new(FrameType::FileChunk, 0, data);
+                                        let idx = g.chunk_index.unwrap_or(0);
+                                        let start = (idx * nsmt_core::frame::CHUNK_SIZE as u64) as usize;
+                                        let chunk = if start < data.len() {
+                                            data[start..std::cmp::min(start + nsmt_core::frame::CHUNK_SIZE, data.len())].to_vec()
+                                        } else {
+                                            Vec::new()
+                                        };
+                                        let mut payload = (idx as u32).to_le_bytes().to_vec();
+                                        payload.extend_from_slice(&chunk);
+                                        let c = Frame::new(FrameType::FileChunk, 0, payload);
                                         fs.send(&c).await?;
                                     }
                                     None => {
+                                        // 服务器没有 → 尝试返回持有者 peer 地址（P2P 直连拉取）
+                                        let peer_hint = match state.object_owner(&user_domain, &g.blob_id).await {
+                                            Some(owner) => state.registry.online_machine(&user_domain, &owner).await
+                                                .map(|m| m.peer_addr).unwrap_or_default(),
+                                            None => String::new(),
+                                        };
                                         let e = nsmt_core::messages::ErrorMsg {
                                             code: "0xE020".into(),
-                                            message: "object not found".into(),
+                                            message: if peer_hint.is_empty() { "object not found".into() } else { format!("object not found; peer={peer_hint}") },
                                             request_id: None,
                                         };
                                         fs.send_json(FrameType::Error, 0, &e).await?;
@@ -194,7 +226,19 @@ pub async fn handle(conn: quinn::Connection, state: Arc<ServerState>, tenants: A
                             }
                             FrameType::FilePut => {
                                 let fp: FilePut = frame.payload_json()?;
-                                pending_put = Some(fp);
+                                let temp_path = server_fs.temp_path_for(&fp.blob_id);
+                                let _ = std::fs::remove_file(&temp_path);
+                                pending_upload = Some(PendingUpload {
+                                    blob_id: fp.blob_id.clone(),
+                                    size: fp.size,
+                                    total_chunks: fp.total_chunks,
+                                    temp_path,
+                                    received: vec![false; fp.total_chunks as usize],
+                                    received_count: 0,
+                                });
+                                fs.send_json(FrameType::FilePutAck, 0, &FilePutAck {
+                                    blob_id: fp.blob_id, have: Vec::new(), completed: false,
+                                }).await?;
                             }
                             FrameType::LockAcquire => {
                                 let l: LockAcquire = frame.payload_json()?;
@@ -238,7 +282,7 @@ pub async fn handle(conn: quinn::Connection, state: Arc<ServerState>, tenants: A
                 0,
                 &OnlineDelta {
                     kind: OnlineDeltaKind::Leave,
-                    machine: MachineInfo { machine_id: reg.machine_id, agents: Vec::new(), addr: String::new(), last_seen: 0 },
+                    machine: MachineInfo { machine_id: reg.machine_id, agents: Vec::new(), addr: String::new(), peer_addr: String::new(), last_seen: 0 },
                 },
             )?,
         )
@@ -263,5 +307,40 @@ where
         },
     )
     .await?;
+    Ok(())
+}
+
+/// 进行中的分块上传。
+struct PendingUpload {
+    blob_id: String,
+    size: u64,
+    total_chunks: u64,
+    temp_path: std::path::PathBuf,
+    received: Vec<bool>,
+    received_count: u64,
+}
+
+/// 处理一个 FILE_CHUNK 载荷：`[u32 LE chunk_index][data]`。
+async fn handle_chunk(
+    server_fs: &crate::fs::ServerFs,
+    pu: &mut PendingUpload,
+    payload: &[u8],
+) -> anyhow::Result<()> {
+    if payload.len() < 4 {
+        return Ok(());
+    }
+    let idx = u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]) as u64;
+    let data = &payload[4..];
+    if idx >= pu.total_chunks || pu.received[idx as usize] {
+        return Ok(());
+    }
+    std::fs::create_dir_all(pu.temp_path.parent().unwrap_or(std::path::Path::new(".")))?;
+    let offset = (idx * nsmt_core::frame::CHUNK_SIZE as u64) as u64;
+    use std::io::{Seek, SeekFrom, Write};
+    let mut f = std::fs::OpenOptions::new().create(true).write(true).open(&pu.temp_path)?;
+    f.seek(SeekFrom::Start(offset))?;
+    f.write_all(data)?;
+    pu.received[idx as usize] = true;
+    pu.received_count += 1;
     Ok(())
 }

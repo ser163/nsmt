@@ -6,6 +6,8 @@ use crate::error::NsmtError;
 pub const MAGIC: u8 = 0x59;
 /// 协议版本（v0.1）。
 pub const PROTOCOL_VERSION: u8 = 1;
+/// 文件分块大小（1 MiB）。
+pub const CHUNK_SIZE: usize = 1024 * 1024;
 /// 单帧 payload 上限（16 MiB）。
 pub const MAX_PAYLOAD_LEN: u32 = 16 * 1024 * 1024;
 
@@ -32,6 +34,7 @@ pub enum FrameType {
     FileGet = 0x33,
     FilePut = 0x34,
     FileChunk = 0x35,
+    FilePutAck = 0x36,
     LockAcquire = 0x40,
     LockRenew = 0x41,
     LockRelease = 0x42,
@@ -63,6 +66,7 @@ impl FrameType {
             0x33 => Self::FileGet,
             0x34 => Self::FilePut,
             0x35 => Self::FileChunk,
+            0x36 => Self::FilePutAck,
             0x40 => Self::LockAcquire,
             0x41 => Self::LockRenew,
             0x42 => Self::LockRelease,

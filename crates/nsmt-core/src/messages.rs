@@ -36,6 +36,9 @@ pub struct Ticket {
 pub struct Register {
     pub machine_id: String,
     pub agent_tag: String,
+    /// P2P 直连监听地址（客户端上报）。
+    #[serde(default)]
+    pub peer_addr: String,
     /// 机器公钥（hex，Ed25519）。
     pub machine_pubkey: String,
     /// 对 `machine_id + "\n" + agent_tag` 的机器签名（hex）。
@@ -48,6 +51,9 @@ pub struct MachineInfo {
     pub machine_id: String,
     pub agents: Vec<String>,
     pub addr: String,
+    /// P2P 直连地址（客户端监听），为空则不可直连。
+    #[serde(default)]
+    pub peer_addr: String,
     pub last_seen: u64,
 }
 
@@ -171,6 +177,23 @@ pub struct FileDiffResult {
 pub struct FileGet {
     pub blob_id: String,
     pub chunk_index: Option<u64>,
+}
+
+/// 服务器对 FILE_PUT 的确认：已收到的块（供客户端断点续传）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FilePutAck {
+    pub blob_id: String,
+    #[serde(default)]
+    pub have: Vec<u64>,
+    pub completed: bool,
+}
+
+/// FILE_CHUNK 的元信息（独立于二进制载荷发送前）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FileChunkMeta {
+    pub blob_id: String,
+    pub chunk_index: u64,
+    pub len: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -10,3 +10,8 @@ nsmt-core = { path = "../nsmt-core" }
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
+object_store.workspace = true
+tokio.workspace = true
+bytes = "1"
+tracing.workspace = true
+async-trait.workspace = true

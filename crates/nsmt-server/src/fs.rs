@@ -6,6 +6,7 @@
 
 use nsmt_core::messages::{FileTree, FileTreeEntry};
 use nsmt_fs::ObjectStore as _;
+use nsmt_fs::ObjectStore;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -24,13 +25,12 @@ fn now_ms() -> u64 {
 #[derive(Clone)]
 pub struct ServerFs {
     root: PathBuf,
-    objects: nsmt_fs::LocalObjectStore,
+    objects: std::sync::Arc<dyn ObjectStore>,
 }
 
 impl ServerFs {
-    pub fn new(base: &Path, user_domain: &str) -> Self {
+    pub fn new(base: &Path, user_domain: &str, objects: std::sync::Arc<dyn ObjectStore>) -> Self {
         let root = base.join("server").join(sanitize(user_domain));
-        let objects = nsmt_fs::LocalObjectStore::new(root.join("objects"));
         Self { root, objects }
     }
 
@@ -42,16 +42,16 @@ impl ServerFs {
     }
 
     /// 存一个对象（委托对象存储抽象；决策 #10 可换 S3 后端）。
-    pub fn put_object(&self, blob_id: &str, bytes: &[u8]) -> std::io::Result<()> {
-        self.objects.put(blob_id, bytes)
+    pub async fn put_object(&self, blob_id: &str, bytes: &[u8]) -> std::io::Result<()> {
+        self.objects.put(blob_id, bytes).await
     }
 
-    pub fn get_object(&self, blob_id: &str) -> Option<Vec<u8>> {
-        self.objects.get(blob_id)
+    pub async fn get_object(&self, blob_id: &str) -> Option<Vec<u8>> {
+        self.objects.get(blob_id).await
     }
 
-    pub fn object_exists(&self, blob_id: &str) -> bool {
-        self.objects.exists(blob_id)
+    pub async fn object_exists(&self, blob_id: &str) -> bool {
+        self.objects.exists(blob_id).await
     }
 
     /// 保存目录树（最新树 + 按 tree_hash 存档）。
@@ -69,6 +69,11 @@ impl ServerFs {
             return None;
         }
         serde_json::from_str(&std::fs::read_to_string(p).ok()?).ok()
+    }
+
+    /// 上传临时文件路径（分块写入用）。
+    pub fn temp_path_for(&self, blob_id: &str) -> std::path::PathBuf {
+        self.root.join("tmp").join(format!("{blob_id}.part"))
     }
 
     pub fn latest_tree(&self) -> Option<FileTree> {
