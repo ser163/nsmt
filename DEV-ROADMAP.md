@@ -90,12 +90,12 @@
 
 ## 6. Backlog (待办池)
 
-- Conflict merge GUI (web/桌面).
-- P2P NAT hole punching + peer authentication (replace dev no-verify TLS).
-- S3 实机多租户（每个 user 一个 bucket prefix）.
-- E2E key rotation & per-tenant keys.
-- Memory vector DB 跨机聚合优化（域池分片）.
-- Admin web: process restart, backup/restore of tenants.
+- [x] Conflict merge GUI (web/桌面) — ✅ M9.2 `yggd conflicts-web`
+- [x] P2P NAT hole punching + peer authentication — ✅ M9.1
+- [x] S3 实机多租户（每个 user 一个 bucket prefix）— ✅ M9.3
+- [x] E2E key rotation & per-tenant keys — ✅ M9.4
+- [x] Memory vector DB 跨机聚合优化（域池分片）— ✅ M9.5
+- [x] Admin web: process restart, backup/restore of tenants — ✅ M7.2 + 控制 API backup/restore
 
 ## 7. Task Breakdown & Milestones (任务清单)
 
@@ -111,23 +111,23 @@
 - [x] **M6.3 配额按用户 ✅**：`users.plan`（free=50MB / pro=1GiB）→ `ServerState.quota_for(domain)`；注册响应返回 quota_bytes=52428800；无用户库时回退全局 env
 - [x] **M6.4 固定记忆 ✅**（2026-08-30 实测通过）：客户端首启把共享目录绝对路径写入**共享记忆**（经服务器 MEMORY_CAPTURE，域池 note，key=`nsmt:share_dir`）+ 本地托底（双写）+ marker `~/.nsmt/share.path`（落盘后不再重复写，离线首启可重试）；任何 agent `recall` 共享目录都能拿到路径
 
-### M7 — ygg-admin (独立监督器 + Web UI) (planned)
+### M7 — ygg-admin (独立监督器 + Web UI) (已完成 ✅)
 
-- [ ] **M7.1 ygg-admin 监督器**：spawn/restart/kill ygg 子进程；健康/CPU/内存监控；崩溃自动拉起
-- [ ] **M7.2 Web UI**：状态页（进程/在线/用量）、租户管理、日志查看（tail + 过滤）
-- [ ] **M7.3 控制 API 客户端**：ygg-admin 轮询 ygg 控制 API 聚合展示
+- [x] **M7.1 ygg-admin 监督器 ✅**：新 crate `nsmt-admin`；spawn/restart/kill ygg 子进程；健康/CPU/内存监控（`ps` 采样）；崩溃自动拉起（指数退避）；`POST /api/restart`（优先经 ygg 控制 API 优雅重启，退出码 3 约定，失败则 kill）
+- [x] **M7.2 Web UI ✅**：内嵌状态页（进程/在线/用量/租户/用户配额/日志 tail）、租户管理、日志查看（行数+过滤）、备份/恢复
+- [x] **M7.3 控制 API 客户端 ✅**：ygg-admin 轮询/代理 ygg 控制 API（status/tenants/online/locks/logs/users/backup/restore）
 
-### M8 — Membership & Quotas UI (planned)
+### M8 — Membership & Quotas UI (已完成 ✅)
 
-- [ ] `users.plan` = free(50MB) / pro(1GiB) …；配额 UI（用量条 + 升级 CTA）
-- [ ] 计费接口预留（Stripe/微信/支付宝），暂不接入
+- [x] **会员/配额 API ✅**：`users.plan`（free=50MB / pro=1GiB）→ 配额按 plan；`GET /api/users`（列表+用量+配额条）、`POST /api/users/{u}/upgrade`（admin 升级）
+- [x] **配额 UI ✅**：ygg-admin Web 用量条 + 升级 CTA；计费接口预留（`set_plan` 为接入点，Stripe/微信/支付宝 后续接入）
 
-### M9 — Hardening (planned)
+### M9 — Hardening (已完成 ✅)
 
-- [ ] P2P 打洞 + 对等认证（替换 dev no-verify TLS）
-- [ ] 冲突合并 GUI（Web 页面对话式合并）
-- [ ] S3 多租户（每用户 bucket prefix）
-- [ ] E2E 密钥轮换 & 按租户密钥
-- [ ] 域池向量库跨机聚合优化
+- [x] **M9.1 P2P 打洞 + 对等认证 ✅**：P2P 应用层对等认证（PeerHello/PeerAuth/PeerAuthOk，域密钥签名，替换 no-verify TLS 作为信任基础）；服务器对象 miss 时广播 PeerHint（含 requester 外部地址），持有者主动打洞（hole_punch 打开 NAT 映射）
+- [x] **M9.2 冲突合并 GUI ✅**：`yggd conflicts-web [port]` 内嵌 axum Web 页（对话式：对比本地/远端、三选一解决：保留本地/远端/自定义合并）
+- [x] **M9.3 S3 多租户 ✅**：`PrefixedObjectStore` 按租户 `t/<domain>/objects/` 前缀隔离（S3/内存共享后端）
+- [x] **M9.4 E2E 密钥轮换 & 按租户密钥 ✅**：`NSMT_E2E_KEYS`（逗号分隔多密钥，最新在前，加密用最新、解密尝试全部）；`derive_tenant_key(master, domain)` 按租户派生，无需网络分发
+- [x] **M9.5 域池向量库跨机聚合 ✅**：`NSMT_POOL_GATEWAYS`（逗号分隔多分片）；recall fan-out 聚合（按内容排序截断 top limit）、capture 按 fqn 哈希路由单分片
 
 > 优先级：M6（控制 API + 用户系统）→ M7（ygg-admin）→ M8（会员）→ M9（加固）。

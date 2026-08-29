@@ -160,6 +160,10 @@ t/<user_domain>/queue/<machine_id>         ← 离线待同步队列
 | 0x43 | `LOCK_GRANTED` | s→c | 授予 |
 | 0x44 | `LOCK_DENIED` | s→c | 拒绝（含持有者） |
 | 0x45 | `LOCK_NOTIFY` | s→c | 锁状态广播 |
+| 0x50 | `PEER_HELLO` | c⇄c | P2P 对等认证①：自报身份（M9.1） |
+| 0x51 | `PEER_AUTH` | c⇄c | P2P 对等认证②：下发 nonce |
+| 0x52 | `PEER_AUTH_OK` | c⇄c | P2P 对等认证③：域密钥签名 + 确认 |
+| 0x53 | `PEER_HINT` | s→c | 对象 miss 打洞信令：通知持有者 requester 外部地址 |
 | 0xF0 | `ERROR` | 任意 | 错误（见 §9） |
 
 ---
@@ -341,7 +345,17 @@ yggd                                    ygg
 
 - 传输：QUIC/TLS 1.3（默认加密）；
 - 租户隔离：服务器强制命名空间前缀校验（见 §2.4）+ 集成测试；
-- 可选 E2E：`flags.bit0` 开启，payload 用租户域密钥派生密钥加密；
+- 可选 E2E：`flags.bit0` 开启，payload 用租户密钥派生密钥加密；
+  - **按租户密钥（M9.4）**：`derive_tenant_key(master, domain) = SHA-256("nsmt:e2e:v1:" || domain || master)`，
+    server/client 同域派生一致，无需网络分发；
+  - **密钥轮换（M9.4）**：`NSMT_E2E_KEYS`（逗号分隔，最新在前）；加密用最新，解密尝试全部，
+    旧密钥保留即可解密历史数据；新密钥加到列表头并重启两端完成轮换；
+- **P2P 对等认证（M9.1）**：P2P 连接建立后先做应用层认证（`PEER_HELLO → PEER_AUTH → PEER_AUTH_OK`），
+  双方用**用户域私钥**对 nonce 签名，同域机器彼此可验（共享 domain key），替换 dev no-verify TLS 作为信任基础；
+- **NAT 打洞（M9.1）**：服务器观测各机器外部地址；对象 miss 时除返回 `peer=<peer_addr>` 提示外，
+  还向持有者广播 `PEER_HINT`（含 requester 外部地址），持有者主动 `hole_punch` 打开 NAT 映射；
+- **S3 多租户（M9.3）**：共享对象后端（S3/内存）按租户加前缀 `t/<domain>/objects/`，本地后端按根目录隔离；
+- **域池分片（M9.5）**：`NSMT_POOL_GATEWAYS` 逗号分隔多网关；recall fan-out 聚合、capture 按 fqn 哈希路由；
 - 票据：短期 + 绑定机器 + 可吊销（`ygg admin revoke`）。
 
 ---
