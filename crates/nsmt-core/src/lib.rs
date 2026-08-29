@@ -10,7 +10,10 @@
 pub mod error;
 pub mod frame;
 pub mod identity;
+pub mod messages;
+pub mod wire;
 
 pub use error::{ErrorCode, NsmtError};
 pub use frame::{Flags, Frame, FrameCodec, FrameType};
 pub use identity::{AgentTag, Fqn, MachineId, UserDomain};
+pub use wire::FrameStream;

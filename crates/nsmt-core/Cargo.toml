@@ -14,3 +14,4 @@ thiserror.workspace = true
 ed25519-dalek.workspace = true
 machine-uid.workspace = true
 hostname.workspace = true
+tokio.workspace = true
