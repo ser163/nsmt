@@ -144,6 +144,11 @@ pub fn pool_from_env() -> MemoryPool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    /// 环境变量是进程级的，测试并行时会互相污染；
+    /// 用静态锁把改 env 的用例串行化（测试工具集要点之一）。
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn shard_for_stable_hash_routing() {
@@ -162,6 +167,7 @@ mod tests {
 
     #[test]
     fn pool_from_env_parses_gateways() {
+        let _guard = ENV_LOCK.lock().unwrap();
         std::env::set_var("NSMT_POOL_GATEWAYS", "http://127.0.0.1:9001, http://127.0.0.1:9002/");
         let pool = pool_from_env();
         assert_eq!(pool.shard_count(), 2);
@@ -170,6 +176,7 @@ mod tests {
 
     #[test]
     fn pool_from_env_single_default() {
+        let _guard = ENV_LOCK.lock().unwrap();
         std::env::remove_var("NSMT_POOL_GATEWAYS");
         std::env::remove_var("NSMT_POOL_GATEWAY");
         let pool = pool_from_env();
