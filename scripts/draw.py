@@ -64,11 +64,26 @@ def fetch_pollinations(prompt: str, out: str, width: int, height: int,
         "nologo": "true", "model": model, "seed": seed,
         "private": "true",
     }
-    url = POLLINATIONS.format(prompt=urllib.parse.quote(prompt)) + "?" + urllib.parse.urlencode(q)
+    url = POLLINATIONS.format(prompt=urllib.parse.quote(prompt, safe="")) + "?" + urllib.parse.urlencode(q)
     print(f"[pollinations] {model} {width}x{height} seed={seed} …", file=sys.stderr)
     req = urllib.request.Request(url, headers={"User-Agent": "maka-draw/1.0"})
-    with urllib.request.urlopen(req, timeout=180, context=_ssl_context()) as r:
-        data = r.read()
+    # 免费服务偶发限流（429/5xx），指数退避重试
+    for attempt in range(4):
+        try:
+            with urllib.request.urlopen(req, timeout=180, context=_ssl_context()) as r:
+                data = r.read()
+            break
+        except urllib.error.HTTPError as e:
+            if e.code in (429, 500, 502, 503, 504) and attempt < 3:
+                wait = 3 * (attempt + 1)
+                print(f"  {e.code} 限流，{wait}s 后重试 ({attempt + 1}/3)…", file=sys.stderr)
+                time.sleep(wait)
+            else:
+                raise
+        except Exception:
+            raise
+    else:
+        raise SystemExit("生图失败：多次限流")
     with open(out, "wb") as f:
         f.write(data)
     print(f"✓ {out} ({len(data)} bytes)")
