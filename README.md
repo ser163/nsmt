@@ -26,6 +26,8 @@ with identity, locking, resume, P2P, encryption, quotas and a web admin console.
 
 ## Architecture
 
+![NSMT Architecture](nsmt.png)
+
 ```
                        User Domain "ser163"
 ┌──────────────────────────────────────────────────────────────┐
@@ -38,7 +40,7 @@ with identity, locking, resume, P2P, encryption, quotas and a web admin console.
 │  │  ├ Tencent GW │            │  ├ Tencent GW │  ← memory    │
 │  │  ├ nsmt_share │            │  ├ nsmt_share │  ← files     │
 │  │  └ P2P listener            │  └ P2P listener              │
-│  └──────┬────────┘            └──────┬────────┘              │
+│  └──────┬────────┘            └──────┬────────┘               │
 │         │       QUIC (UDP)           │  P2P direct            │
 │         └──────────────┬─────────────┘                        │
 │                        ▼                                     │
