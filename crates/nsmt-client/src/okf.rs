@@ -249,22 +249,21 @@ fn append_log(root: &Path, entry: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// 生成 index.md（§8：index.md 可出现在任何目录；仅 bundle 根可带 okf_version frontmatter）
-/// 为每个含概念的目录生成/刷新，子目录 index.md 无 frontmatter。
-fn generate_index(root: &Path, root_frontmatter: bool) -> anyhow::Result<()> {
+/// 生成 index.md（§8：index.md 无 frontmatter，出现在任何目录）。
+/// 为每个含概念的目录生成/刷新；条目链接相对所在目录（relative-url）。
+fn generate_index(root: &Path) -> anyhow::Result<()> {
     let files = collect_md_files(root);
     // 按父目录分组（含根 "."）
     let mut groups: std::collections::BTreeMap<String, Vec<PathBuf>> = Default::default();
     for rel in &files {
-        let dir = rel.parent().map(|p| p.display().to_string()).unwrap_or_else(|| ".".into());
+        let dir = rel
+            .parent()
+            .map(|p| p.display().to_string().replace('\\', "/"))
+            .unwrap_or_else(|| ".".into());
         groups.entry(dir).or_default().push(rel.clone());
     }
     for (dir, rels) in &groups {
         let mut out = String::new();
-        // 仅根目录 index.md 带 okf_version（§12）；子目录 index.md 无 frontmatter（§8）
-        if root_frontmatter && dir == "." {
-            out.push_str(&format!("---\nokf_version: {OKF_VERSION}\n---\n\n"));
-        }
         let heading = if dir == "." { "Knowledge Bundle" } else { "Concepts" };
         out.push_str(&format!("# {heading}\n\n"));
         for rel in rels {
@@ -275,7 +274,13 @@ fn generate_index(root: &Path, root_frontmatter: bool) -> anyhow::Result<()> {
             let desc = load_concept(&p)
                 .and_then(|(fm, _)| fm_str(&fm, "description"))
                 .unwrap_or_default();
-            let link = rel.display().to_string().replace('\\', "/");
+            // §8：条目链接为相对 URL——子目录 index.md 的链接相对该子目录
+            let rel_s = rel.display().to_string().replace('\\', "/");
+            let link = if dir == "." {
+                rel_s.clone()
+            } else {
+                rel_s.strip_prefix(&format!("{dir}/")).unwrap_or(&rel_s).to_string()
+            };
             if desc.is_empty() {
                 out.push_str(&format!("* [{title}]({link})\n"));
             } else {
@@ -287,15 +292,13 @@ fn generate_index(root: &Path, root_frontmatter: bool) -> anyhow::Result<()> {
         std::fs::create_dir_all(idx_path.parent().unwrap_or(root))?;
         std::fs::write(&idx_path, out)?;
     }
-    // 无概念时确保根 index.md 存在（占位）
+    // 无概念时确保根 index.md 存在（占位，无 frontmatter）
     if groups.is_empty() {
         std::fs::create_dir_all(root)?;
-        let mut out = String::new();
-        if root_frontmatter {
-            out.push_str(&format!("---\nokf_version: {OKF_VERSION}\n---\n\n"));
-        }
-        out.push_str("# Knowledge Bundle\n\n_No concepts yet. Run `yggd okf <lib> add <path> --type <Type>`._\n");
-        std::fs::write(root.join("index.md"), out)?;
+        std::fs::write(
+            root.join("index.md"),
+            "# Knowledge Bundle\n\n_No concepts yet. Run `yggd okf <lib> add <path> --type <Type>`._\n",
+        )?;
     }
     Ok(())
 }
@@ -340,19 +343,19 @@ fn cmd_lib_new(args: &[String]) -> anyhow::Result<()> {
         anyhow::bail!("library already exists: {}", dir.display());
     }
     std::fs::create_dir_all(&dir)?;
-    // 根 index.md 带 okf_version 声明（§8/§12）
-    let mut idx = format!("---\nokf_version: {OKF_VERSION}\n");
+    // 根 index.md：无 frontmatter（§8）；标题/描述可放入正文顶部
+    let mut idx = String::from("# Knowledge Bundle\n\n");
     if let Some(t) = opts.get("title") {
         if !t.is_empty() {
-            idx.push_str(&format!("title: {t}\n"));
+            idx.push_str(&format!("> {t}\n\n"));
         }
     }
     if let Some(d) = opts.get("description") {
         if !d.is_empty() {
-            idx.push_str(&format!("description: {d}\n"));
+            idx.push_str(&format!("> {d}\n\n"));
         }
     }
-    idx.push_str("---\n\n# Knowledge Bundle\n\n_Empty library. Run `yggd okf <lib> add <path> --type <Type>`._\n");
+    idx.push_str("_Empty library. Run `yggd okf <lib> add <path> --type <Type>`._\n");
     std::fs::write(dir.join("index.md"), idx)?;
     std::fs::write(dir.join("log.md"), "# Directory Update Log\n\n")?;
     println!("okf: library `{name}` created at {}", dir.display());
@@ -611,7 +614,6 @@ fn cmd_list(args: &[String]) -> anyhow::Result<()> {
                 continue;
             }
         }
-        let title = fm_str(&fm, "title").unwrap_or_else(|| rel.display().to_string());
         let desc = fm_str(&fm, "description").unwrap_or_default();
         let tags = fm_tags(&fm);
         let tag_s = if tags.is_empty() { String::new() } else { format!(" [{}]", tags.join(",")) };
@@ -657,7 +659,7 @@ fn cmd_show(args: &[String]) -> anyhow::Result<()> {
 /// `yggd okf <lib> index`
 fn cmd_index(args: &[String]) -> anyhow::Result<()> {
     let (dir, _) = resolve_lib(args)?;
-    generate_index(&dir, true)?;
+    generate_index(&dir)?;
     println!("okf: index.md refreshed for library");
     Ok(())
 }
@@ -744,5 +746,5 @@ Concept CRUD inside a library:
 
 OKF v0.2 rules enforced: type required (§4.1); reserved filenames index.md/log.md
 (§3.1); concept id = path minus .md (§2); generated.by actor process:nsmt (§7);
-root index.md carries okf_version (§12); unknown frontmatter keys preserved on
-edit (§4.1); removal records **Deprecation** in log.md (§9)."#;
+index.md carries no frontmatter, per-directory links are relative (§8); unknown
+frontmatter keys preserved on edit (§4.1); removal records **Deprecation** in log.md (§9)."#;
