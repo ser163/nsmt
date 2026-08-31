@@ -24,3 +24,4 @@ notify.workspace = true
 axum.workspace = true
 http-body-util = "0.1"
 tokio-util.workspace = true
+serde_yaml = "0.9"

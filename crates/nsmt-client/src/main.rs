@@ -9,6 +9,7 @@
 //!           NSMT_SHARE_DIR / NSMT_OBJECTS_DIR / NSMT_SYMLINK_VIEW
 
 mod conflicts_web;
+mod okf;
 mod fs;
 mod memory;
 
@@ -77,6 +78,11 @@ async fn main() -> anyhow::Result<()> {
         let port: u16 = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(8088);
         let bind = std::net::SocketAddr::from(([127, 0, 0, 1], port));
         return conflicts_web::serve(bind).await;
+    }
+
+    // OKF 知识包命令（纯本地文件操作，无需服务器连接）
+    if command == Some("okf") {
+        return okf::run(&args);
     }
 
     let conn = connect(server_addr).await?;
