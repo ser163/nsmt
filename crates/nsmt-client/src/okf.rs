@@ -249,22 +249,24 @@ fn append_log(root: &Path, entry: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// 生成 index.md（§8：按目录分组；库根 index.md 带 okf_version frontmatter）
+/// 生成 index.md（§8：index.md 可出现在任何目录；仅 bundle 根可带 okf_version frontmatter）
+/// 为每个含概念的目录生成/刷新，子目录 index.md 无 frontmatter。
 fn generate_index(root: &Path, root_frontmatter: bool) -> anyhow::Result<()> {
     let files = collect_md_files(root);
+    // 按父目录分组（含根 "."）
     let mut groups: std::collections::BTreeMap<String, Vec<PathBuf>> = Default::default();
     for rel in &files {
         let dir = rel.parent().map(|p| p.display().to_string()).unwrap_or_else(|| ".".into());
         groups.entry(dir).or_default().push(rel.clone());
     }
-    let mut out = String::new();
-    if root_frontmatter {
-        out.push_str(&format!("---\nokf_version: {OKF_VERSION}\n---\n\n"));
-    }
-    out.push_str("# Knowledge Bundle\n\n");
     for (dir, rels) in &groups {
-        let heading = if dir == "." { "Root Concepts" } else { dir };
-        out.push_str(&format!("## {heading}\n\n"));
+        let mut out = String::new();
+        // 仅根目录 index.md 带 okf_version（§12）；子目录 index.md 无 frontmatter（§8）
+        if root_frontmatter && dir == "." {
+            out.push_str(&format!("---\nokf_version: {OKF_VERSION}\n---\n\n"));
+        }
+        let heading = if dir == "." { "Knowledge Bundle" } else { "Concepts" };
+        out.push_str(&format!("# {heading}\n\n"));
         for rel in rels {
             let p = root.join(rel);
             let title = load_concept(&p)
@@ -281,12 +283,20 @@ fn generate_index(root: &Path, root_frontmatter: bool) -> anyhow::Result<()> {
             }
         }
         out.push('\n');
+        let idx_path = if dir == "." { root.join("index.md") } else { root.join(&dir).join("index.md") };
+        std::fs::create_dir_all(idx_path.parent().unwrap_or(root))?;
+        std::fs::write(&idx_path, out)?;
     }
-    if files.is_empty() {
-        out.push_str("_No concepts yet. Run `yggd okf <lib> add <path> --type <Type>`._\n");
+    // 无概念时确保根 index.md 存在（占位）
+    if groups.is_empty() {
+        std::fs::create_dir_all(root)?;
+        let mut out = String::new();
+        if root_frontmatter {
+            out.push_str(&format!("---\nokf_version: {OKF_VERSION}\n---\n\n"));
+        }
+        out.push_str("# Knowledge Bundle\n\n_No concepts yet. Run `yggd okf <lib> add <path> --type <Type>`._\n");
+        std::fs::write(root.join("index.md"), out)?;
     }
-    std::fs::create_dir_all(root)?;
-    std::fs::write(root.join("index.md"), out)?;
     Ok(())
 }
 
@@ -473,12 +483,20 @@ fn cmd_add(args: &[String]) -> anyhow::Result<()> {
     });
     let desc = opts.get("description").cloned().unwrap_or_default();
     let tags = opts.get("tags").cloned().unwrap_or_default();
-    let status = opts.get("status").cloned().unwrap_or_else(|| "draft".into());
+    // §5.4: absent `status` ⇒ stable（规范默认），显式传 draft 标记未审阅
+    let status = opts.get("status").cloned().unwrap_or_else(|| "stable".into());
+    if !["draft", "stable", "deprecated"].contains(&status.as_str()) {
+        anyhow::bail!("invalid status `{status}` (draft | stable | deprecated, §5.4)");
+    }
+    let resource = opts.get("resource").cloned().unwrap_or_default(); // §4.1 推荐字段
 
     let mut fm = format!("type: {ftype}\n");
     fm.push_str(&format!("title: {title}\n"));
     if !desc.is_empty() {
         fm.push_str(&format!("description: {desc}\n"));
+    }
+    if !resource.is_empty() {
+        fm.push_str(&format!("resource: {resource}\n"));
     }
     if !tags.is_empty() {
         let list: Vec<String> = tags.split(',').map(|t| t.trim().to_string()).filter(|t| !t.is_empty()).collect();
@@ -535,6 +553,11 @@ fn cmd_edit(args: &[String]) -> anyhow::Result<()> {
             set_fm(&mut fm, "description", serde_yaml::Value::String(d.clone()));
         }
     }
+    if let Some(r) = opts.get("resource") {
+        if !r.is_empty() {
+            set_fm(&mut fm, "resource", serde_yaml::Value::String(r.clone())); // §4.1
+        }
+    }
     if let Some(t) = opts.get("tags") {
         if !t.is_empty() {
             let list: Vec<String> = t.split(',').map(|x| x.trim().to_string()).filter(|x| !x.is_empty()).collect();
@@ -543,7 +566,15 @@ fn cmd_edit(args: &[String]) -> anyhow::Result<()> {
     }
     if let Some(s) = opts.get("status") {
         if !s.is_empty() {
+            if !["draft", "stable", "deprecated"].contains(&s.as_str()) {
+                anyhow::bail!("invalid status `{s}` (draft | stable | deprecated, §5.4)");
+            }
             set_fm(&mut fm, "status", serde_yaml::Value::String(s.clone()));
+        }
+    }
+    if let Some(st) = opts.get("stale-after") {
+        if !st.is_empty() {
+            set_fm(&mut fm, "stale_after", serde_yaml::Value::String(st.clone())); // §5.5 绝对时刻
         }
     }
     // 内容变更 → 更新 generated.at（保留 generated.by）
@@ -703,12 +734,12 @@ Library management:
   yggd okf libs validate <name>                              Check OKF conformance (§11)
 
 Concept CRUD inside a library:
-  yggd okf <lib> add <rel-path> --type T [--title X] [--description D] [--tags a,b] [--status draft|stable|deprecated]
+  yggd okf <lib> add <rel-path> --type T [--title X] [--description D] [--resource URI] [--tags a,b] [--status draft|stable|deprecated]
   yggd okf <lib> rm <rel-path>
-  yggd okf <lib> edit <rel-path> [--type T] [--title X] [--description D] [--tags a,b] [--status S]
+  yggd okf <lib> edit <rel-path> [--type T] [--title X] [--description D] [--resource URI] [--tags a,b] [--status S] [--stale-after ISO8601]
   yggd okf <lib> list [--type T]
   yggd okf <lib> show <rel-path>
-  yggd okf <lib> index                       Refresh index.md (§8)
+  yggd okf <lib> index                       Refresh index.md per directory (§8)
   yggd okf <lib> log <message>               Append log.md entry (§9)
 
 OKF v0.2 rules enforced: type required (§4.1); reserved filenames index.md/log.md
