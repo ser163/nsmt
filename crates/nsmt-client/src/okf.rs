@@ -250,22 +250,26 @@ fn append_log(root: &Path, entry: &str) -> anyhow::Result<()> {
 }
 
 /// 生成 index.md（§8：index.md 无 frontmatter，出现在任何目录）。
-/// 为每个含概念的目录生成/刷新；条目链接相对所在目录（relative-url）。
+/// - 每个直接含概念的目录生成 index.md，条目链接相对该目录（relative-url）
+/// - bundle 根 index.md 始终生成：列出子目录 + 根级概念（progressive disclosure）
 fn generate_index(root: &Path) -> anyhow::Result<()> {
     let files = collect_md_files(root);
-    // 按父目录分组（含根 "."）
-    let mut groups: std::collections::BTreeMap<String, Vec<PathBuf>> = Default::default();
+    // 分组：根级概念 vs 各子目录概念
+    let mut root_concepts: Vec<PathBuf> = Vec::new();
+    let mut dir_groups: std::collections::BTreeMap<String, Vec<PathBuf>> = Default::default();
     for rel in &files {
-        let dir = rel
-            .parent()
-            .map(|p| p.display().to_string().replace('\\', "/"))
-            .unwrap_or_else(|| ".".into());
-        groups.entry(dir).or_default().push(rel.clone());
+        let parent = rel.parent();
+        let is_root = parent.is_none() || parent == Some(Path::new(""));
+        if is_root {
+            root_concepts.push(rel.clone());
+        } else {
+            let dir = parent.unwrap().display().to_string().replace('\\', "/");
+            dir_groups.entry(dir).or_default().push(rel.clone());
+        }
     }
-    for (dir, rels) in &groups {
-        let mut out = String::new();
-        let heading = if dir == "." { "Knowledge Bundle" } else { "Concepts" };
-        out.push_str(&format!("# {heading}\n\n"));
+    // 子目录 index.md（相对链接）
+    for (dir, rels) in &dir_groups {
+        let mut out = String::from("# Concepts\n\n");
         for rel in rels {
             let p = root.join(rel);
             let title = load_concept(&p)
@@ -274,13 +278,9 @@ fn generate_index(root: &Path) -> anyhow::Result<()> {
             let desc = load_concept(&p)
                 .and_then(|(fm, _)| fm_str(&fm, "description"))
                 .unwrap_or_default();
-            // §8：条目链接为相对 URL——子目录 index.md 的链接相对该子目录
+            // §8：子目录 index.md 的链接相对该子目录
             let rel_s = rel.display().to_string().replace('\\', "/");
-            let link = if dir == "." {
-                rel_s.clone()
-            } else {
-                rel_s.strip_prefix(&format!("{dir}/")).unwrap_or(&rel_s).to_string()
-            };
+            let link = rel_s.strip_prefix(&format!("{dir}/")).unwrap_or(&rel_s).to_string();
             if desc.is_empty() {
                 out.push_str(&format!("* [{title}]({link})\n"));
             } else {
@@ -288,18 +288,36 @@ fn generate_index(root: &Path) -> anyhow::Result<()> {
             }
         }
         out.push('\n');
-        let idx_path = if dir == "." { root.join("index.md") } else { root.join(&dir).join("index.md") };
+        let idx_path = root.join(&dir).join("index.md");
         std::fs::create_dir_all(idx_path.parent().unwrap_or(root))?;
         std::fs::write(&idx_path, out)?;
     }
-    // 无概念时确保根 index.md 存在（占位，无 frontmatter）
-    if groups.is_empty() {
-        std::fs::create_dir_all(root)?;
-        std::fs::write(
-            root.join("index.md"),
-            "# Knowledge Bundle\n\n_No concepts yet. Run `yggd okf <lib> add <path> --type <Type>`._\n",
-        )?;
+    // 根 index.md：子目录条目（§8 支持）+ 根级概念
+    let mut out = String::from("# Knowledge Bundle\n\n");
+    for dir in dir_groups.keys() {
+        out.push_str(&format!("* [{dir}]({dir}/)\n"));
     }
+    for rel in &root_concepts {
+        let p = root.join(rel);
+        let title = load_concept(&p)
+            .and_then(|(fm, _)| fm_str(&fm, "title"))
+            .unwrap_or_else(|| rel.display().to_string());
+        let desc = load_concept(&p)
+            .and_then(|(fm, _)| fm_str(&fm, "description"))
+            .unwrap_or_default();
+        let link = rel.display().to_string().replace('\\', "/");
+        if desc.is_empty() {
+            out.push_str(&format!("* [{title}]({link})\n"));
+        } else {
+            out.push_str(&format!("* [{title}]({link}) - {desc}\n"));
+        }
+    }
+    if files.is_empty() {
+        out.push_str("_No concepts yet. Run `yggd okf <lib> add <path> --type <Type>`._\n");
+    }
+    out.push('\n');
+    std::fs::create_dir_all(root)?;
+    std::fs::write(root.join("index.md"), out)?;
     Ok(())
 }
 
