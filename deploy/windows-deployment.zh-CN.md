@@ -145,7 +145,46 @@ nssm set NSMT-Yggd AppEnvironmentExtra "NSMT_USER_DOMAIN=<域名> NSMT_AGENT_TAG
 nssm start NSMT-Yggd
 ```
 
-### 3.5 排障速查
+### 3.5 OKF 知识包接口（Open Knowledge Format v0.2）
+
+共享目录可直接作为 **OKF 知识包（bundle）** 使用——纯 Markdown + YAML frontmatter 的开放格式（Google Cloud 发布，Apache-2.0）。`yggd okf` 提供创建/校验/索引命令，文件仍走 NSMT 正常同步/锁/冲突处理：
+
+```bash
+# bundle 根：默认 NSMT_SHARE_DIR；可用 NSMT_OKF_ROOT 覆盖
+
+# 初始化 + 创建概念（type 为唯一必填字段，自动生成 frontmatter 模板）
+yggd okf init
+yggd okf new tables/orders.md --type "BigQuery Table" --title "Customer Orders" \
+      --description "One row per completed order" --tags sales,orders
+
+# 校验符合性（每个 .md 须有 frontmatter + 非空 type；bad.md 会报错退出码 1）
+yggd okf validate
+
+# 浏览 / 生成目录索引 / 展示 / 记录变更
+yggd okf list [--type T]
+yggd okf index            # 按目录生成 index.md（§8）
+yggd okf show <path>      # frontmatter + 正文预览
+yggd okf log "<message>"  # 追加 log.md（§9）
+```
+
+生成的 concept 示例：
+
+```markdown
+---
+type: BigQuery Table
+title: Customer Orders
+description: One row per completed order
+tags: [sales, orders]
+status: draft
+generated: { by: process:nsmt, at: 2026-08-31T05:43:01Z }
+---
+
+# Customer Orders
+```
+
+任何 OKF 消费者（Agent、工具）均可直接读取共享目录；`index.md`/`log.md` 为保留文件名（§3.1），自动生成。
+
+### 3.6 排障速查
 
 | 现象 | 检查 |
 |------|------|
