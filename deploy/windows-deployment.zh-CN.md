@@ -145,44 +145,32 @@ nssm set NSMT-Yggd AppEnvironmentExtra "NSMT_USER_DOMAIN=<域名> NSMT_AGENT_TAG
 nssm start NSMT-Yggd
 ```
 
-### 3.5 OKF 知识包接口（Open Knowledge Format v0.2）
+### 3.5 OKF 知识库接口（Open Knowledge Format v0.2）
 
-共享目录可直接作为 **OKF 知识包（bundle）** 使用——纯 Markdown + YAML frontmatter 的开放格式（Google Cloud 发布，Apache-2.0）。`yggd okf` 提供创建/校验/索引命令，文件仍走 NSMT 正常同步/锁/冲突处理：
+共享目录下可建**多个 OKF 知识库**（每个知识库 = 一个独立 bundle，纯 Markdown + YAML frontmatter 开放格式，Google Cloud 发布，Apache-2.0）。文件仍走 NSMT 正常同步/锁/冲突处理。
 
 ```bash
-# bundle 根：默认 NSMT_SHARE_DIR；可用 NSMT_OKF_ROOT 覆盖
+# 布局: <NSMT_OKF_ROOT>/<知识库>/  = 一个 OKF bundle（默认根 <共享目录>/okf）
 
-# 初始化 + 创建概念（type 为唯一必填字段，自动生成 frontmatter 模板）
-yggd okf init
-yggd okf new tables/orders.md --type "BigQuery Table" --title "Customer Orders" \
-      --description "One row per completed order" --tags sales,orders
+# ── 知识库管理 ──
+yggd okf libs new epdheat --title "EPDHeat 知识库" --description "工业物联网供热知识"
+yggd okf libs list                              # 库列表（概念数 + 标题）
+yggd okf libs show epdheat                      # 库详情（type 分布 + 日志摘要）
+yggd okf libs validate epdheat                  # 符合性校验（§11）
+yggd okf libs rm xunhubiji --force              # 删库（必须 --force）
 
-# 校验符合性（每个 .md 须有 frontmatter + 非空 type；bad.md 会报错退出码 1）
-yggd okf validate
-
-# 浏览 / 生成目录索引 / 展示 / 记录变更
-yggd okf list [--type T]
-yggd okf index            # 按目录生成 index.md（§8）
-yggd okf show <path>      # frontmatter + 正文预览
-yggd okf log "<message>"  # 追加 log.md（§9）
+# ── 库内概念 CRUD ──
+yggd okf epdheat add tables/heat-exchange.md --type "Device Table" \
+      --title "换热站设备表" --description "换热站设备台账" --tags heat,device
+yggd okf epdheat edit tables/heat-exchange.md --status stable   # 改（保留未知 frontmatter 字段）
+yggd okf epdheat list [--type Metric]           # 查（概念 ID = 路径去 .md）
+yggd okf epdheat show tables/heat-exchange.md   # 详情
+yggd okf epdheat rm metrics/r2.md               # 删（log.md 记 **Deprecation**）
+yggd okf epdheat index                          # 刷新 index.md（§8，带 okf_version 声明）
+yggd okf epdheat log "<message>"                # 追加 log.md（§9）
 ```
 
-生成的 concept 示例：
-
-```markdown
----
-type: BigQuery Table
-title: Customer Orders
-description: One row per completed order
-tags: [sales, orders]
-status: draft
-generated: { by: process:nsmt, at: 2026-08-31T05:43:01Z }
----
-
-# Customer Orders
-```
-
-任何 OKF 消费者（Agent、工具）均可直接读取共享目录；`index.md`/`log.md` 为保留文件名（§3.1），自动生成。
+**规范强制项**（OKF v0.2）：`type` 为唯一必填字段（§4.1）；`index.md`/`log.md` 保留文件名（§3.1）；`generated.by` 使用 actor 约定 `process:nsmt`（§7）；根 `index.md` 携带 `okf_version: 0.2`（§12）；edit 保留未知字段（§4.1）；删除概念记录 `**Deprecation**` 日志（§9）。任何 OKF 消费者（Agent、工具）可直接读取知识库目录。
 
 ### 3.6 排障速查
 
