@@ -1,113 +1,235 @@
-# Hermes (Windows) 部署文档 —— 含 TencentDB Agent Memory 记忆引擎与 L1 激活
+# Hermes Agent — Windows 部署指南
 
-> 适用：Windows 10/11，本机实战验证环境（2026-08-31）
-> 覆盖：Hermes 本体 → memory_tencentdb 记忆引擎 → **L1 蒸馏层激活**（含根因与修复）→ 验证与排障
-> 关联：`deploy/windows-deployment.zh-CN.md`（NSMT 多机共享，可选扩展）
-
----
-
-## 第 1 部分：架构总览
-
-```
-┌─ Hermes 桌面应用（Windows）──────────────────────────────┐
-│  config.yaml  /  .env（凭证与配置）                       │
-│  内置记忆 MEMORY.md / USER.md（双轨制，始终 active）       │
-│  memory_tencentdb provider（插件）                        │
-│    └─ supervisor 自动拉起 gateway（首次对话时）            │
-└──────────────┬──────────────────────────────────────────┘
-               │ HTTP 127.0.0.1:8420
-┌──────────────▼──────────────────────────────────────────┐
-│ TencentDB Agent Memory Gateway (v1)                     │
-│  LLM 提取  → DeepSeek chat（deepseek-chat）             │
-│  Embedding → 智谱 GLM embedding-3（OpenAI 兼容）         │
-│  存储      → SQLite 向量库 ~/.memory-tencentdb/memory-tdai│
-│  蒸馏链    → L0 原始对话 → L1 记忆原子 → L2 场景 → L3 画像 │
-└─────────────────────────────────────────────────────────┘
-```
-
-**双轨制说明**：Hermes 内置记忆（Markdown）与 TencentDB 外部记忆（向量库）并行，互不替代。本文档聚焦外部记忆引擎的部署与激活。
+> 版本：适用于 Hermes Agent（Nous Research）桌面版 / CLI / 网关，Windows 10/11
+> 目标读者：需要在 Windows 环境部署、配置与运维 Hermes 的开发者
+> 本文覆盖：安装、配置、模型接入、记忆系统（含 TencentDB Agent Memory 集成与 L1 蒸馏层激活）、运行形态、验证、运维与排障
 
 ---
 
-## 第 2 部分：前置环境
+## 1. 产品概述
 
-| 组件 | 要求 | 验证 |
+Hermes Agent 是 Nous Research 开源的 AI Agent 框架，可在终端、桌面应用、消息平台与 IDE 中运行。核心能力：
+
+- **工具调用**：终端、文件系统、浏览器、代码执行等 20+ 工具集
+- **持久记忆**：内置记忆 + 可插拔外部记忆 Provider（TencentDB Agent Memory / Mem0 / Honcho 等）
+- **技能系统**：将成功流程沉淀为可复用技能（SKILL.md）
+- **多运行面**：CLI / Ink TUI / Electron 桌面 / Web Dashboard / 消息网关 / ACP (IDE)
+- **Provider 无关**：OpenRouter、DeepSeek、Anthropic、智谱 GLM 等 20+ 供应商
+
+### 1.1 架构示意
+
+```
+┌──────────────────────────────────────────────────────────────┐
+│ Hermes Agent（Windows 进程）                                  │
+│  ├─ CLI / TUI / Desktop / Gateway 多运行面                    │
+│  ├─ 内置记忆（MEMORY.md / USER.md）                           │
+│  └─ memory provider 插件（可选）                              │
+│       └─ supervisor 按需拉起外部记忆 gateway                   │
+└───────────────┬──────────────────────────────────────────────┘
+                │ HTTP
+┌───────────────▼──────────────────────────────────────────────┐
+│ TencentDB Agent Memory Gateway（可选，:8420）                 │
+│  L0 对话 → L1 记忆原子 → L2 场景 → L3 用户画像（LLM 蒸馏）      │
+│  向量检索：OpenAI 兼容 Embedding API（如智谱 GLM embedding-3） │
+│  存储：SQLite 向量库 + FTS5                                    │
+└──────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## 2. 系统要求
+
+| 项目 | 要求 | 说明 |
 |------|------|------|
-| Windows | 10/11 | `winver` |
-| Node.js | ≥ 20（gateway 需要） | `node --version` |
-| Python | ≥ 3.10（Hermes 内置 venv 自带） | — |
-| Hermes 桌面版 | 已安装 | 应用内 `hermes memory status` |
-
-数据目录约定（本机实测）：
-- Hermes 根：`C:\Users\<你>\AppData\Local\hermes\`
-- 记忆引擎数据：`C:\Users\<你>\.memory-tencentdb\`
-- 记忆向量库：`C:\Users\<你>\.memory-tencentdb\memory-tdai\vectors.db`
+| 操作系统 | Windows 10 1809+ / Windows 11 | 原生支持（PowerShell/cmd/Windows Terminal/git-bash） |
+| Python | ≥ 3.10 | 安装脚本自动配置 venv |
+| Node.js | ≥ 20（仅使用 TencentDB 记忆引擎时需要） | Gateway 为 Node/TS 实现 |
+| 磁盘 | ≥ 2 GB | 应用 + 依赖 + 数据 |
+| 内存 | ≥ 8 GB（推荐 16 GB） | 取决于模型调用频率与并发 |
 
 ---
 
-## 第 3 部分：Hermes 本体部署（简述）
+## 3. 安装
 
-1. 安装 Hermes 桌面版（官方渠道），首次启动完成向导
-2. 配置主模型：`config.yaml` → `model:`（本机用 DeepSeek）
-3. 凭证放 `.env`（API key 等），Hermes 启动时自动加载进进程环境
-4. 验证：`hermes memory status` 应显示 Built-in active
-
-> 详细配置见 Hermes 官方文档。本文档重点在第 4-5 部分（记忆引擎）。
-
----
-
-## 第 4 部分：TencentDB Agent Memory 记忆引擎部署
-
-### 4.1 安装 provider 插件
+### 3.1 一键安装
 
 ```bash
-# 1) 下载官方插件包并链接到 Hermes 插件目录
-#    插件目录名必须是 memory_tencentdb（下划线）
-# 2) 配置 config.yaml
-memory:
-  provider: memory_tencentdb
-  memory_enabled: true
-  user_profile_enabled: true
-
-# 3) .env 配置 LLM（复用 DeepSeek key 省钱）
-TDAI_LLM_API_KEY=sk-xxxx
-TDAI_LLM_BASE_URL=https://api.deepseek.com/v1
-TDAI_LLM_MODEL=deepseek-chat        # ⚠️ 见第 5 部分，勿用推理模型
-MEMORY_TENCENTDB_GATEWAY_PORT=8420
+# PowerShell 或 git-bash 执行；自动配置 uv、Python venv 与启动器
+curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash
 ```
 
-### 4.2 工作原理
+安装后 `hermes` 命令进入 PATH（可能需要重开终端）。
 
-- **supervisor 自动拉起**：Hermes 首次对话时自动 Popen 启动 gateway（`src/gateway/server.ts`，监听 8420），继承 Hermes 进程完整环境变量（含 .env 全部变量）
-- **双轨记忆**：内置 MEMORY.md 始终生效，TencentDB 作为增强层
-- 健康检查：`curl http://127.0.0.1:8420/health`
+### 3.2 验证安装
+
+```bash
+hermes --version        # 版本号
+hermes doctor           # 依赖与配置健康检查
+hermes config path      # 配置文件路径
+hermes config env-path  # 环境变量文件路径
+```
+
+### 3.3 目录结构
+
+| 路径 | 用途 |
+|------|------|
+| `%LOCALAPPDATA%\hermes\`（默认） | HERMES_HOME 根目录；可用环境变量 `HERMES_HOME` 自定义 |
+| `…\config.yaml` | 主配置 |
+| `…\.env` | API 密钥与机密 |
+| `…\skills\` | 技能库 |
+| `…\state.db` | 会话存储（SQLite + FTS5） |
+| `…\logs\` | 网关与运行日志 |
+| `…\hermes-agent\` | 源码（git 安装时） |
+
+> 说明：`HERMES_HOME` 支持自定义（如迁移到非系统盘）。设置后所有子路径随之变化；配置文件加载在进程启动时完成。
 
 ---
 
-## 第 5 部分：⭐ L1 记忆层激活（核心，必读）
+## 4. 配置
 
-### 5.1 现象与根因（实测踩坑）
+### 4.1 配置分层
 
-**现象**：部署后 `l1_records` 表 0 行、`scene_blocks/` 空、recall 报错、记忆引擎"形同虚设"。
+| 层 | 文件 | 内容 | 加载时机 |
+|----|------|------|----------|
+| 配置 | `config.yaml` | 模型、工具、显示、记忆等 | 进程启动 |
+| 机密 | `.env` | API Key、Token | 进程启动，注入 os.environ |
 
-**根因（两个配置叠加）**：
+原则：**配置进 config.yaml，密钥进 .env**。
 
-| # | 根因 | 表现 | 修复 |
-|---|------|------|------|
-| 1 | **embedding provider 默认 `"none"`（禁用）**。v1 gateway 零配置时不启用向量搜索；且 DeepSeek **没有 embeddings API**，光配 `TDAI_LLM_*` 救不了 | `health` 里 `embeddingService: false`；hybrid recall 直接报 `requires EmbeddingService` | 写 `tdai-gateway.yaml` 配**智谱 GLM embedding-3**（OpenAI 兼容） |
-| 2 | **DeepSeek v4-flash 是推理模型**（`reasoning_tokens`），AI SDK 流式解析下输出被截断（`finishReason=length`，仅 17 tokens）→ L1 提取的 JSON 不完整 → `No JSON array found` → 提取 0 条 | 蒸馏任务在跑（日志有 `l1-extraction`）但 `extracted=0` | `TDAI_LLM_MODEL` 改用 **deepseek-chat**（非推理，仅 gateway 用，不影响 Hermes 主模型） |
+### 4.2 初始化配置
 
-> 注：若仅配置了 embedding 而 LLM 用推理模型，L1 提取仍会失败——两个根因是**叠加**关系。
+```bash
+hermes setup            # 交互向导（模型/终端/网关/工具/Agent）
+hermes model            # 模型与 Provider 选择
+hermes config           # 查看当前配置
+hermes config edit      # 编辑 config.yaml
+hermes config set KEY VALUE   # 单键设置，如 hermes config set display.language zh-CN
+```
 
-### 5.2 配置文件：`tdai-gateway.yaml`
-
-放置于独立目录（如 `E:\pr\tencentdb-gateway\tdai-gateway.yaml`），内容：
+### 4.3 关键配置段
 
 ```yaml
+model:
+  provider: deepseek        # 主模型供应商
+  default: deepseek-v4-flash
+  base_url: https://api.deepseek.com/v1
+  context_length: 65536
+
+display:
+  interface: cli            # cli | tui
+  language: zh-CN
+
+memory:
+  provider: memory_tencentdb  # 内置 | memory_tencentdb | mem0 | honcho …
+  memory_enabled: true
+  user_profile_enabled: true
+```
+
+### 4.4 密钥管理
+
+```bash
+# .env 示例
+DEEPSEEK_API_KEY=sk-xxx
+ZAI_API_KEY=xxx            # 智谱 GLM（vision/embedding 等）
+```
+
+OAuth 类凭据使用 `hermes auth add <provider>` 管理（凭据池自动轮换与熔断）。
+
+---
+
+## 5. 模型接入
+
+Hermes 支持 20+ Provider。配置方式二选一：
+
+```bash
+# 方式一：交互选择
+hermes model
+
+# 方式二：config.yaml 直接指定
+model:
+  provider: deepseek
+  default: deepseek-chat
+  api_key: sk-xxx
+```
+
+自定义端点（OpenAI 兼容）：
+
+```yaml
+model:
+  provider: custom
+  base_url: http://127.0.0.1:8000/v1
+  api_key: local
+  default: my-model
+```
+
+辅助模型（视觉/压缩/会话检索）独立配置：
+
+```bash
+hermes config set auxiliary.vision.provider zai
+hermes config set auxiliary.vision.model glm-4v-flash
+```
+
+---
+
+## 6. 记忆系统
+
+### 6.1 双轨架构
+
+| 轨 | 实现 | 状态 |
+|----|------|------|
+| 内置记忆 | `MEMORY.md`（Agent 笔记）+ `USER.md`（用户画像） | 始终 active |
+| 外部 Provider | memory_tencentdb / mem0 / honcho 等 | 增强层，可插拔 |
+
+切换 Provider 不会丢失内置记忆，但不会自动迁移数据（存储后端不互通）。
+
+```bash
+hermes memory status   # 查看 Provider 状态与激活项
+```
+
+### 6.2 TencentDB Agent Memory 集成（memory_tencentdb）
+
+#### 6.2.1 安装 Provider
+
+1. 获取官方插件包（`@tencentdb-agent-memory/memory-tencentdb`），链接到 Hermes 插件目录，**目录名必须为 `memory_tencentdb`**；
+2. `config.yaml` 启用（见 4.3 的 `memory:` 段）；
+3. `.env` 提供 LLM 凭据（Gateway 用于蒸馏提取，可复用现有 DeepSeek key）：
+
+```bash
+TDAI_LLM_API_KEY=sk-xxx
+TDAI_LLM_BASE_URL=https://api.deepseek.com/v1
+TDAI_LLM_MODEL=deepseek-chat
+```
+
+4. 重启 Hermes（Provider 在会话启动时加载）。
+
+#### 6.2.2 Gateway 生命周期
+
+- Hermes 首次对话时，supervisor 自动以 `subprocess.Popen` 拉起 Gateway（默认 `127.0.0.1:8420`），继承 Hermes 进程完整环境变量（含 `.env`）；
+- 健康检查：`curl http://127.0.0.1:8420/health`；
+- 手动启动（调试用，需自行注入环境变量）：
+
+```bash
+cd <插件目录> && export $(grep -E "^(TDAI_LLM|ZAI_API_KEY)" <HERMES_HOME>/.env | xargs) \
+  && node --import tsx src/gateway/server.ts
+```
+
+### 6.3 ⭐ L1 蒸馏层激活（必读配置约束）
+
+> v1 Gateway 的「L0 对话 → L1 记忆原子」蒸馏链存在**两个默认配置陷阱**，未处理时表现为：`l1_records` 表恒为 0、`scene_blocks/` 为空、recall 报错——即记忆引擎部署成功但功能不可用。
+
+#### 6.3.1 约束 1：Embedding 默认禁用
+
+- 设计：`memory.embedding.provider` 默认 `"none"`（零配置用户不产生任何 embedding 调用）；远端 embedding 为可选增强；
+- 后果：`health` 返回 `embeddingService: false`，`hybrid` 召回策略直接报错；
+- 注意：DeepSeek **不提供 embeddings API**，不能复用其作为 embedding 源；
+- 解决：配置任一 OpenAI 兼容 embedding 服务。**示例：智谱 GLM embedding-3**（`ZAI_API_KEY` 复用）：
+
+```yaml
+# tdai-gateway.yaml（路径自定，如 E:\pr\tencentdb-gateway\tdai-gateway.yaml）
 llm:
   enabled: true
   baseUrl: https://api.deepseek.com/v1
-  apiKey: ${TDAI_LLM_API_KEY}        # ${VAR} 会被进程环境变量展开
+  apiKey: ${TDAI_LLM_API_KEY}     # ${VAR} 启动时从进程环境展开
   model: deepseek-chat
   maxTokens: 4096
   timeoutMs: 120000
@@ -115,110 +237,169 @@ llm:
 memory:
   embedding:
     enabled: true
-    provider: zhipu                  # OpenAI 兼容远端服务
+    provider: zhipu               # OpenAI 兼容远端服务
     baseUrl: https://open.bigmodel.cn/api/paas/v4
-    apiKey: ${ZAI_API_KEY}           # 智谱 key
+    apiKey: ${ZAI_API_KEY}
     model: embedding-3
-    dimensions: 2048                 # 必须与模型匹配
+    dimensions: 2048              # 必须与所选模型输出维度一致
     sendDimensions: true
-    timeoutMs: 10000
-    recallTimeoutMs: 3000
-    captureTimeoutMs: 15000
   recall:
     strategy: hybrid
 ```
 
-### 5.3 环境变量（`.env` 追加）
+#### 6.3.2 约束 2：蒸馏 LLM 禁用推理模型
+
+- 现象：`l1-extraction` 任务执行但 `finishReason=length`（输出仅十几个 token 即截断）→ 提取 JSON 不完整 → 日志 `No JSON array found` → `extracted=0`；
+- 根因：推理模型（如 DeepSeek v4-flash，响应含 `reasoning_tokens`）经 AI SDK 流式解析时输出被截断，兼容性不足；
+- 解决：`TDAI_LLM_MODEL` 使用非推理模型（如 `deepseek-chat`）。该变量仅作用于 Gateway，不影响 Hermes 主模型。
+
+#### 6.3.3 配置加载与生效
 
 ```bash
-# 让 gateway 加载上述配置（supervisor 拉起时自动生效）
+# .env 追加（supervisor 拉起时自动生效）
 TDAI_GATEWAY_CONFIG=E:/pr/tencentdb-gateway/tdai-gateway.yaml
-# gateway 专用 LLM 用非推理模型（不影响 Hermes 主模型）
 TDAI_LLM_MODEL=deepseek-chat
 ```
 
-> ⚠️ 配置加载优先级：`TDAI_GATEWAY_CONFIG`（显式路径）> CWD 的 `tdai-gateway.yaml` > dataDir 的 yaml > 纯 env。Hermes supervisor 的 Popen **不传 cwd**（继承 Hermes 进程目录），所以必须用 `TDAI_GATEWAY_CONFIG` 显式指定。
+配置文件解析顺序：`TDAI_GATEWAY_CONFIG`（显式）> 当前工作目录 `tdai-gateway.yaml` > 数据目录 yaml > 纯环境变量。**注意**：Hermes supervisor 的 Popen 不设置 cwd（继承 Hermes 进程目录），因此必须使用 `TDAI_GATEWAY_CONFIG` 显式指定路径。
 
-### 5.4 生效与验证
+#### 6.3.4 验证
 
 ```bash
-# 1) 重启 gateway（或让 Hermes 重启后自动拉起）
+# 1) 关键指标：embeddingService 必须为 true
 curl -s http://127.0.0.1:8420/health
-#   期望: "embeddingService": true   ← 关键指标
 
-# 2) 灌入一段真实对话（触发蒸馏）
+# 2) 灌入对话触发蒸馏
 curl -s -X POST http://127.0.0.1:8420/capture -H "Content-Type: application/json" \
   -d '{"user_content":"你好，我是Harry","assistant_content":"你好Harry！","session_key":"demo-001"}'
-#   期望: {"l0_recorded":2,"scheduler_notified":true}
 
-# 3) 等待 30-60s，查 L1 记忆
-sqlite3 ~/.memory-tencentdb/memory-tdai/vectors.db "SELECT type, scene_name, substr(content,1,50) FROM l1_records;"
-#   期望: 出现 persona / episodic 记录（不再为空）
+# 3) 等待 30-60s，查询 L1 记录（应非空）
+sqlite3 ~/.memory-tencentdb/memory-tdai/vectors.db \
+  "SELECT type, scene_name, substr(content,1,50) FROM l1_records;"
 
-# 4) 语义召回
+# 4) 语义召回（应返回含用户画像的 context）
 curl -s -X POST http://127.0.0.1:8420/recall -H "Content-Type: application/json" \
   -d '{"query":"我是谁","session_key":"demo-002"}'
-#   期望: 返回包含用户画像(context)的 JSON
 ```
 
----
+预期结果（本机验证 2026-08-31）：`embeddingService: true`；`l1_records` 含 persona/episodic 类型记录；recall 返回 L3 用户画像（Archetype / 偏好 / 项目语境）。
 
-## 第 6 部分：日常验证与可视化
-
-### 6.1 记忆引擎状态
-
-```bash
-hermes memory status            # Provider: memory_tencentdb ← active
-curl -s http://127.0.0.1:8420/health
-# 关注: stores.vectorStore / stores.embeddingService / services.pipelineWorker
-```
-
-### 6.2 记忆可视化查看器
-
-v1 无官方面板（v2 的 8125 面板需 v2 部署）。使用本地查看器：
-
-```
-E:\pr\memory-viewer\查看记忆.bat    # 双击：读 vectors.db + JSONL → 生成 HTML → 打开浏览器
-```
-
-功能：L0 对话时间线、L1 记忆列表（类型/场景/优先级）、全文搜索、统计卡片。
-
-### 6.3 数据位置
+### 6.4 数据存储
 
 | 数据 | 路径 |
 |------|------|
-| 向量库 | `~/.memory-tencentdb/memory-tdai/vectors.db` |
+| 向量库 | `~/.memory-tencentdb/memory-tdai/vectors.db`（SQLite + FTS5 + WAL） |
 | 原始对话 | `~/.memory-tencentdb/memory-tdai/conversations/*.jsonl` |
 | 场景块 | `~/.memory-tencentdb/memory-tdai/scene_blocks/*.md` |
-| 配置 | `E:\pr\tencentdb-gateway\tdai-gateway.yaml` |
+| 蒸馏检查点 | `~/.memory-tencentdb/memory-tdai/.metadata/` |
+
+### 6.5 可视化（可选）
+
+v1 无官方 Web 面板（v2 Team Memory 才有 8125 面板）。可使用本地只读查看器：读取 `vectors.db` + JSONL 生成自包含 HTML（对话时间线 / L1 记忆 / 全文搜索）。
 
 ---
 
-## 第 7 部分：排障清单
+## 7. 运行形态
+
+### 7.1 交互对话
+
+```bash
+hermes                     # CLI 默认
+hermes chat -q "问题"      # 单次查询
+hermes desktop             # 桌面应用（别名 hermes gui）
+hermes dashboard           # Web 管理台
+```
+
+### 7.2 消息网关（可选）
+
+```bash
+hermes gateway setup       # 配置平台（Telegram/微信/Discord 等 20+）
+hermes gateway run         # 前台运行
+hermes gateway install     # 安装为后台服务
+hermes gateway status
+```
+
+### 7.3 工具与技能
+
+```bash
+hermes tools list          # 工具清单
+hermes skills browse       # 技能市场
+hermes skills install ID   # 安装技能
+```
+
+---
+
+## 8. 验证矩阵
+
+| 项 | 命令 | 通过标准 |
+|----|------|----------|
+| 安装 | `hermes doctor` | 无 error 项 |
+| 模型 | `hermes chat -q "ping"` | 正常回复 |
+| 记忆 Provider | `hermes memory status` | `memory_tencentdb ← active` |
+| Gateway | `curl :8420/health` | `status: ok`，`embeddingService: true` |
+| 蒸馏 | 见 6.3.4 | `l1_records` 非空 |
+| 工具 | `hermes tools list` | 目标工具 available |
+| 会话 | `hermes sessions list` | 有会话记录 |
+
+---
+
+## 9. 运维
+
+### 9.1 更新
+
+```bash
+hermes update
+```
+
+### 9.2 备份
+
+| 数据 | 建议 |
+|------|------|
+| 配置 | 备份 `config.yaml` + `.env`（.env 含密钥，注意保管） |
+| 会话 | `hermes sessions export <out.jsonl>` |
+| 外部记忆 | 备份 `~/.memory-tencentdb/memory-tdai/` 整个目录（SQLite 建议先停止 Gateway 或用 `sqlite3 .backup`） |
+
+### 9.3 多实例（Profiles）
+
+```bash
+hermes profile create work --clone
+hermes profile use work
+hermes profile export work    # 打包迁移
+```
+
+### 9.4 卸载
+
+```bash
+hermes uninstall
+```
+
+---
+
+## 10. 排障
 
 | 现象 | 根因 | 解决 |
 |------|------|------|
-| `embeddingService: false` | embedding 未配置（默认 none） | 配置 `tdai-gateway.yaml` 的 `memory.embedding`（见 5.2） |
+| 首次运行 HTTP 400 "No models provided" | config.yaml 带 UTF-8 BOM（记事本保存） | 另存为无 BOM UTF-8；用 `hermes config edit` |
+| `embeddingService: false` | embedding provider 未配置（默认 none） | 配置 `memory.embedding`（6.3.1） |
 | recall 报 `requires EmbeddingService` | 同上 | 同上 |
-| L1 蒸馏任务跑但 `extracted=0`、日志 `No JSON array found`、`finishReason=length` | LLM 是推理模型（v4-flash），输出被截断 | `TDAI_LLM_MODEL=deepseek-chat` |
-| embedding 429 `余额不足` | 智谱账户无额度 | 充值；embedding-3 极便宜 |
-| `tenant_not_found`（NSMT 场景） | 租户表无热重载 | 注册后重启服务器 |
-| gateway 手动启动后 embedding 仍 false | 手动 node 启动没带 .env 变量 | 用 Hermes supervisor 拉起，或先 `export $(grep -E "^(TDAI_LLM|ZAI)" .env | xargs)` |
-| 想查蒸馏是否执行 | gateway 日志 | 搜 `l1-extraction`、`pipeline-worker`、`l1_extracted_count` |
+| L1 提取 `extracted=0` / `No JSON array found` / `finishReason=length` | 蒸馏 LLM 为推理模型 | `TDAI_LLM_MODEL=deepseek-chat` |
+| embedding HTTP 429 | 供应商账户无额度 | 充值；embedding 调用极便宜 |
+| 手动起 Gateway 后配置不生效 | 手动进程未继承 `.env` | 先 export .env 变量，或用 supervisor 拉起 |
+| 配置修改不生效 | 进程启动时读取 | 重启 CLI/网关；网关内 `/restart` |
+| 工具不可用 | toolset 未启用或缺 env | `hermes tools`；补 `.env`；`/reset` |
 
 ---
 
-## 第 8 部分：多机共享扩展（可选）
+## 附录 A：本机参考环境（2026-08-31 验证）
 
-- **官方 v2 Team Memory**：多机 Agent 指向 proxy:8096，官方多机共享方案（Docker 部署）
-- **NSMT（Yggdrasil）**：Rust/QUIC 多机记忆+文件网络层，Windows 已验证（3 个补丁已提交本仓库）；部署见 `deploy/windows-deployment.zh-CN.md`
-- 互联网场景建议：v2 + Tailscale 组网，或 NSMT 做 P2P 直连
+- Windows 10 + Node v24 + Python 3.11（uv venv）
+- Hermes 主模型：DeepSeek（v4-flash）
+- 记忆引擎：memory_tencentdb + Gateway 8420 + DeepSeek(chat) + 智谱 GLM embedding-3
+- 验证结果：L1 记忆 5 条（persona×2 + episodic×3）；recall 返回完整 L3 画像；蒸馏链 L0→L3 全通
 
----
+## 附录 B：相关资源
 
-## 附录：本机验证记录（2026-08-31）
-
-- `embeddingService: true`（智谱 GLM embedding-3，2048 维）
-- `l1_records`: 5 条（persona ×2 + episodic ×3），覆盖身份、悬壶笔记架构、供热预测模型、排障过程
-- recall 返回完整 L3 用户画像（Archetype / 基本信息 / 长期偏好 / 章节叙事）
-- 蒸馏链 L0→L1→L2→L3 全通，对话实时沉淀为可召回记忆
+- 官方文档：https://hermes-agent.nousresearch.com/docs/
+- 源码：https://github.com/NousResearch/hermes-agent
+- 记忆引擎上游：https://github.com/TencentCloud/TencentDB-Agent-Memory
+- 多机共享记忆（NSMT）：见本仓库 `deploy/windows-deployment.zh-CN.md`
