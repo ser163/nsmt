@@ -309,17 +309,44 @@ where
     tracing::info!("initial sync done: {} entries, tree={}", local_tree.entries.len(), local_tree.tree_hash);
 
     // 文件监听
+    // 自愈式：共享目录可能被外部删除/重建，notify watcher 的句柄会失效且不自动恢复。
+    // 每 2s 健康检查：确保目录存在（create_dir_all）+ 在 watcher 失联时重新挂载。
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<()>();
     {
+        use std::sync::atomic::{AtomicBool, Ordering};
         let tx = tx.clone();
         let dir2 = dir.clone();
+        let need_rewatch = std::sync::Arc::new(AtomicBool::new(true));
+        let nr = need_rewatch.clone();
         tokio::spawn(async move {
-            let mut watcher = notify::recommended_watcher(move |_res: notify::Result<notify::Event>| {
+            let mut watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
+                if res.is_err() {
+                    // watcher 失联（典型：被监听目录被删除/移动）
+                    nr.store(true, Ordering::Relaxed);
+                }
                 let _ = tx.send(());
             })
             .expect("watcher");
-            watcher.watch(&dir2, notify::RecursiveMode::Recursive).expect("watch");
-            std::future::pending::<()>().await; // 保持 watcher 存活
+            let mut watching = false;
+            loop {
+                // 目录可能被外部删除 → 确保存在，watcher 才能挂上
+                let _ = std::fs::create_dir_all(&dir2);
+                if need_rewatch.load(Ordering::Relaxed) && !watching {
+                    match watcher.watch(&dir2, notify::RecursiveMode::Recursive) {
+                        Ok(_) => {
+                            watching = true;
+                            need_rewatch.store(false, Ordering::Relaxed);
+                        }
+                        Err(e) => tracing::warn!("watch {} failed: {e} (will retry)", dir2.display()),
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                // 目录被删 → 已挂载句柄失效，标记重挂（下一轮 create_dir_all 重建后再挂）
+                if !dir2.exists() {
+                    watching = false;
+                    need_rewatch.store(true, Ordering::Relaxed);
+                }
+            }
         });
     }
 
