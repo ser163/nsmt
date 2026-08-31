@@ -101,6 +101,34 @@ yggd 127.0.0.1:5555 conflicts-web [port]     # default 127.0.0.1:8088
 # open http://127.0.0.1:8088 → 冲突列表 → 本地/远端并排预览 → 保留本地/远端/自定义合并
 ```
 
+### OKF knowledge libraries (OKF 知识库, M10)
+
+The shared dir doubles as OKF v0.2 bundle storage — create/read/edit/query
+conformant knowledge libraries that sync like any other file:
+
+```bash
+# layout: <NSMT_OKF_ROOT>/<library>/ = one OKF bundle (default root: <share>/okf)
+export NSMT_OKF_ROOT=~/nsmt_share/okf
+
+yggd okf libs new epdheat --title "EPDHeat KB"           # create library
+yggd okf libs list                                       # list libraries
+yggd okf libs show epdheat                               # library details
+yggd okf libs rm epdheat --force                         # remove library
+yggd okf libs validate epdheat                           # OKF §11 conformance
+
+yggd okf epdheat add tables/orders.md --type "BigQuery Table" \
+      --title "Orders" --description "One row per order" --tags sales
+yggd okf epdheat edit tables/orders.md --status stable   # edit (keeps unknown fields)
+yggd okf epdheat list [--type Metric]                    # query concepts
+yggd okf epdheat show tables/orders.md                   # view concept
+yggd okf epdheat rm tables/orders.md                     # delete (log **Deprecation**)
+yggd okf epdheat index                                   # refresh per-directory index.md
+yggd okf epdheat log "message"                           # append log.md entry
+```
+
+Follows the official [OKF v0.2 spec](https://github.com/GoogleCloudPlatform/open-knowledge-format);
+output passes the third-party validator `okft` (0 errors / 0 warnings).
+
 ### P2P 直连与打洞 (M9.1)
 
 - 客户端默认起 P2P 监听器；对端连接时先做**域密钥签名对等认证**（不再信任任意 no-verify TLS）；

@@ -145,7 +145,7 @@ nssm set NSMT-Yggd AppEnvironmentExtra "NSMT_USER_DOMAIN=<域名> NSMT_AGENT_TAG
 nssm start NSMT-Yggd
 ```
 
-### 3.5 OKF 知识库接口（Open Knowledge Format v0.2）
+### 3.5 OKF 知识库接口（Open Knowledge Format v0.2, M10）
 
 共享目录下可建**多个 OKF 知识库**（每个知识库 = 一个独立 bundle，纯 Markdown + YAML frontmatter 开放格式，Google Cloud 发布，Apache-2.0）。文件仍走 NSMT 正常同步/锁/冲突处理。
 

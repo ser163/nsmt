@@ -19,8 +19,9 @@ NSMT（代号 **Yggdrasil**，北欧神话世界树）让不同机器上的 agen
 | M6 | 控制 API（`--control :8091`）· 用户系统（sqlx Any：SQLite/MySQL/PG + argon2）· 按用户配额（free=50MB / pro=1GiB）· 固定记忆（`nsmt:share_dir` note） |
 | M7 | `ygg-admin` 独立监督器（spawn/restart/kill ygg、崩溃自动拉起）+ Web UI（:8090）+ 控制 API 聚合 |
 | M8 | 会员（`users.plan` free/pro）· 配额 UI（用量条 + 升级 CTA）· 计费接口预留 |
-| M9 | P2P 对等认证 + NAT 打洞 · 冲突合并 Web GUI（`conflicts-web`）· S3 多租户前缀 · E2E 密钥轮换/按租户 · 域池分片 |
-| 待办池 | 后台进程重启 · 租户备份/恢复（控制 API） |
+| M9 | P2P 对等认证 + NAT 打洞 · 冲突 Web GUI（`conflicts-web`）· S3 租户前缀 · E2E 密钥轮换/按租户密钥 · 域池分片 |
+| M10 | **OKF 知识库** — `yggd okf` 在共享目录上管理 OKF v0.2 知识包（多库增删改查、符合性校验、逐目录 index.md/log.md） |
+| Backlog | Admin 进程重启 · 租户备份/恢复（控制 API） |
 
 ---
 
@@ -63,7 +64,7 @@ NSMT（代号 **Yggdrasil**，北欧神话世界树）让不同机器上的 agen
 | 二进制 | crate | 角色 | 端口 |
 |---|---|---|---|
 | `ygg` | `nsmt-server` | relay + registry + 锁 + 对象存储 + 记忆池 + 用户 + 控制 API | UDP 5555, :8091 |
-| `yggd` | `nsmt-client` | 握手、记忆双写/托底、文件同步（CAS/目录树/diff/锁/续传/P2P）、冲突 CLI + Web GUI | P2P 监听, :8088 |
+| `yggd` | `nsmt-client` | 握手、记忆双写/托底、文件同步（CAS/目录树/diff/锁/续传/P2P）、冲突 CLI + Web GUI、OKF 知识库 | P2P 监听, :8088 |
 | `ygg-admin` | `nsmt-admin` | 独立监督器 + Web UI + 控制 API 聚合 | :8090 |
 | — | `nsmt-core` | 身份、帧编解码、消息、E2E 加密、对等认证帧 | — |
 | — | `nsmt-memory` | 腾讯 Gateway HTTP 客户端（recall/capture/search/health） | — |
@@ -124,6 +125,27 @@ yggd 127.0.0.1:5555 conflicts                          # 列出冲突副本
 yggd 127.0.0.1:5555 merge .sync-conflict-xxx [--keep-local|--keep-remote]
 yggd 127.0.0.1:5555 conflicts-web                      # Web GUI（:8088）
 ```
+
+### OKF 知识库（Open Knowledge Format v0.2）
+
+共享目录可直接作为 **OKF 知识包（bundle）** 存储。`yggd okf` 创建/读取/编辑/查询符合规范的知识库，随文件同步分发到域内每台机器：
+
+```bash
+# 布局: <NSMT_OKF_ROOT>/<知识库>/ = 一个 OKF bundle（默认根 <共享目录>/okf）
+
+yggd okf libs new epdheat --title "EPDHeat 知识库"     # 建库
+yggd okf libs list                                     # 库列表
+yggd okf epdheat add tables/orders.md --type "BigQuery Table" \
+      --title "Orders" --description "每行一个订单" --tags sales
+yggd okf epdheat edit tables/orders.md --status stable # 改（保留未知字段）
+yggd okf epdheat list [--type Metric]                  # 查询概念
+yggd okf epdheat show tables/orders.md                 # 查看概念
+yggd okf epdheat rm tables/orders.md                   # 删除（log.md 记 **Deprecation**）
+yggd okf epdheat index                                 # 刷新逐目录 index.md
+yggd okf libs validate epdheat                         # OKF §11 符合性校验
+```
+
+严格遵循官方 [OKF v0.2 规范](https://github.com/GoogleCloudPlatform/open-knowledge-format)（type 必填 frontmatter、保留文件名 `index.md`/`log.md`、actor 约定、渐进式披露索引）。产物通过第三方校验器 [okft](https://github.com/PoorvaJ-WW/okft) 验证（0 error / 0 warning）。
 
 ---
 

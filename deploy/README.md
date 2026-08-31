@@ -9,7 +9,7 @@
 | Component | Binary | Role | Default Ports |
 |---|---|---|---|
 | Server | `ygg` | relay + registry + locks + object store + domain memory pool + control API + users | UDP 5555 (QUIC), :8091 (control API) |
-| Client | `yggd` | agent-side daemon (memory + file sync + P2P + conflict GUI) | P2P listener (ephemeral), :8088 (conflicts-web) |
+| Client | `yggd` | agent-side daemon (memory + file sync + P2P + conflict GUI + OKF knowledge libraries) | P2P listener (ephemeral), :8088 (conflicts-web) |
 | Admin | `ygg-admin` | out-of-process supervisor (spawn/restart/kill ygg) + Web UI | :8090 (Web UI) |
 | Memory engine | Tencent Gateway (Node) | L0–L3 memory per machine / domain pool | 127.0.0.1:8420 |
 
