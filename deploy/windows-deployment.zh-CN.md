@@ -170,7 +170,7 @@ yggd okf epdheat index                          # 刷新 index.md（§8，带 ok
 yggd okf epdheat log "<message>"                # 追加 log.md（§9）
 ```
 
-**规范强制项**（OKF v0.2）：`type` 为唯一必填字段（§4.1）；`index.md`/`log.md` 保留文件名（§3.1）；`generated.by` 使用 actor 约定 `process:nsmt`（§7）；根 `index.md` 携带 `okf_version: 0.2`（§12）；edit 保留未知字段（§4.1）；删除概念记录 `**Deprecation**` 日志（§9）。任何 OKF 消费者（Agent、工具）可直接读取知识库目录。
+**规范强制项**（OKF v0.2）：`type` 为唯一必填字段（§4.1）；`index.md`/`log.md` 保留文件名（§3.1）；`generated.by` 使用 actor 约定 `process:nsmt`（§7）；`index.md` 无 frontmatter、子目录条目链接相对所在目录（§8）；edit 保留未知字段（§4.1）；删除概念记录 `**Deprecation**` 日志（§9）。产物已通过生态校验器 **okft** 交叉验证（`0 error, 0 warning`），任何 OKF 消费者（Agent、工具）可直接读取知识库目录。
 
 ### 3.6 排障速查
 
