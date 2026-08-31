@@ -139,12 +139,15 @@ yggd okf libs new epdheat --title "EPDHeat KB"          # create a library
 yggd okf libs list                                      # list libraries
 yggd okf epdheat add tables/orders.md --type "BigQuery Table" \
       --title "Orders" --description "One row per order" --tags sales
-yggd okf epdheat edit tables/orders.md --status stable # edit (keeps unknown fields)
+yggd okf epdheat edit tables/orders.md --status stable # edit (keeps unknown fields & comments)
+yggd okf epdheat search "revenue"                     # full-text search (frontmatter + body)
 yggd okf epdheat list [--type Metric]                  # query concepts
 yggd okf epdheat show tables/orders.md                 # view a concept
-yggd okf epdheat rm tables/orders.md                   # delete (logs **Deprecation**)
+yggd okf epdheat rm tables/orders.md                   # move to .trash/ (recoverable)
+yggd okf epdheat restore tables/orders.md              # restore from .trash/
 yggd okf epdheat index                                 # refresh per-directory index.md
 yggd okf libs validate epdheat                         # OKF §11 conformance check
+yggd okf libs validate epdheat --lint                  # + status/ISO-time/reserved-file/link checks
 ```
 
 Strictly follows the official [OKF v0.2 spec](https://github.com/GoogleCloudPlatform/open-knowledge-format)

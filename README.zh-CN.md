@@ -137,12 +137,15 @@ yggd okf libs new epdheat --title "EPDHeat 知识库"     # 建库
 yggd okf libs list                                     # 库列表
 yggd okf epdheat add tables/orders.md --type "BigQuery Table" \
       --title "Orders" --description "每行一个订单" --tags sales
-yggd okf epdheat edit tables/orders.md --status stable # 改（保留未知字段）
+yggd okf epdheat edit tables/orders.md --status stable # 改（保留未知字段与注释）
+yggd okf epdheat search "R2"                            # 全文检索（frontmatter + 正文）
 yggd okf epdheat list [--type Metric]                  # 查询概念
 yggd okf epdheat show tables/orders.md                 # 查看概念
-yggd okf epdheat rm tables/orders.md                   # 删除（log.md 记 **Deprecation**）
+yggd okf epdheat rm tables/orders.md                   # 移入 .trash/ 回收站（可恢复）
+yggd okf epdheat restore tables/orders.md              # 从回收站恢复
 yggd okf epdheat index                                 # 刷新逐目录 index.md
 yggd okf libs validate epdheat                         # OKF §11 符合性校验
+yggd okf libs validate epdheat --lint                  # 追加 status/ISO 时间/保留文件/链接检查
 ```
 
 严格遵循官方 [OKF v0.2 规范](https://github.com/GoogleCloudPlatform/open-knowledge-format)（type 必填 frontmatter、保留文件名 `index.md`/`log.md`、actor 约定、渐进式披露索引）。产物通过第三方校验器 [okft](https://github.com/PoorvaJ-WW/okft) 验证（0 error / 0 warning）。

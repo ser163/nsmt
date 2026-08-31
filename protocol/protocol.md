@@ -1,9 +1,9 @@
-# NSMT Protocol — Yggdrasil 网络协议规范 v0.1
+# NSMT Protocol — Yggdrasil 网络协议规范 v0.2
 
 > 项目：Net Share Memory Tree（Yggdrasil）
-> 协议版本：0.1（草案）
+> 协议版本：0.2
 > 传输：QUIC (HTTP/3 over UDP)
-> 状态：**设计草案，待实现验证**
+> 状态：**已实现**（Windows 全功能验证 + macOS E2E 验证；含文件同步、记忆、P2P、OKF 知识库）
 > 本文件是项目**最重要文档**，所有实现以它为准。
 
 ---

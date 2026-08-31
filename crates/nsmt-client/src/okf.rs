@@ -137,7 +137,7 @@ fn lib_dir(root: &Path, name: &str) -> PathBuf {
     root.join(name)
 }
 
-/// 收集 bundle 内 concept 文件（跳过保留文件），返回相对路径列表
+/// 收集 bundle 内 concept 文件（跳过保留文件与 .trash 回收站），返回相对路径列表
 fn collect_md_files(root: &Path) -> Vec<PathBuf> {
     let mut out = Vec::new();
     if !root.is_dir() {
@@ -148,6 +148,10 @@ fn collect_md_files(root: &Path) -> Vec<PathBuf> {
             for e in rd.flatten() {
                 let p = e.path();
                 if p.is_dir() {
+                    // 跳过 .trash 回收站
+                    if e.file_name().to_string_lossy() == ".trash" {
+                        continue;
+                    }
                     walk(&p, root, out);
                 } else if p.extension().and_then(|x| x.to_str()) == Some("md") {
                     let rel = p.strip_prefix(root).unwrap_or(&p).to_path_buf();
@@ -164,7 +168,7 @@ fn collect_md_files(root: &Path) -> Vec<PathBuf> {
     out
 }
 
-/// 收集知识库（根下含 index.md 或任何 .md 的目录）
+/// 收集知识库（根下含 index.md 或任何 .md 的目录；跳过隐藏目录如 .trash）
 fn collect_libs(root: &Path) -> Vec<String> {
     let mut out = Vec::new();
     if let Ok(rd) = std::fs::read_dir(root) {
@@ -172,7 +176,7 @@ fn collect_libs(root: &Path) -> Vec<String> {
             let p = e.path();
             if p.is_dir() {
                 let name = e.file_name().to_string_lossy().to_string();
-                if valid_lib_name(&name) && has_md(&p) {
+                if valid_lib_name(&name) && !name.starts_with('.') && has_md(&p) {
                     out.push(name);
                 }
             }
@@ -347,6 +351,166 @@ fn validate_bundle(root: &Path) -> anyhow::Result<(usize, usize)> {
     Ok((files.len(), errors))
 }
 
+/// 校验 bundle（--lint 模式，对标生态校验器 okft）。
+/// 在 §11 基础上增加：status 枚举（§5.4）、ISO 8601 时间（§5）、
+/// index.md/log.md 无 frontmatter（§8/§9）、正文 markdown 链接可解析（§6.1）。
+/// 返回 (文档数, 错误数, 警告数)。链接不可解析记 warning（规范 §6.1 允许断链）。
+fn validate_bundle_lint(root: &Path) -> anyhow::Result<(usize, usize, usize)> {
+    if !root.is_dir() {
+        anyhow::bail!("bundle root not found: {}", root.display());
+    }
+    let files = collect_md_files(root);
+    let mut errors = 0;
+    let mut warnings = 0;
+
+    // 保留文件检查：index.md/log.md 不得带 frontmatter（§8/§9）
+    for reserved in RESERVED {
+        let p = root.join(reserved);
+        if p.exists() && parse_doc(&std::fs::read_to_string(&p)?).is_some() {
+            errors += 1;
+            println!("  ✗ {reserved} — reserved file must not have frontmatter (§8/§9)");
+        }
+    }
+
+    for rel in &files {
+        let p = root.join(rel);
+        let Some((fm, body)) = load_concept(&p) else {
+            errors += 1;
+            println!("  ✗ {} — missing/unparseable frontmatter", rel.display());
+            continue;
+        };
+        // type 必填（§11）
+        match fm_str(&fm, "type") {
+            Some(t) if !t.trim().is_empty() => {}
+            _ => {
+                errors += 1;
+                println!("  ✗ {} — frontmatter has no non-empty `type`", rel.display());
+            }
+        }
+        // status 枚举（§5.4）
+        if let Some(s) = fm_str(&fm, "status") {
+            if !["draft", "stable", "deprecated"].contains(&s.as_str()) {
+                errors += 1;
+                println!("  ✗ {} — invalid status `{s}` (§5.4)", rel.display());
+            }
+        }
+        // ISO 8601 时间字段（§5）：generated.at / stale_after / verified[].at
+        check_iso_field(&fm, "stale_after", rel, &mut errors);
+        if let Some(g) = fm.get("generated") {
+            if let Some(at) = g.get("at").and_then(|v| v.as_str()) {
+                if !is_iso8601(at) {
+                    errors += 1;
+                    println!("  ✗ {} — generated.at `{at}` is not ISO 8601 UTC (§5)", rel.display());
+                }
+            }
+        }
+        if let Some(v) = fm.get("verified") {
+            // 单映射或列表
+            let entries: Vec<&serde_yaml::Value> = match v {
+                serde_yaml::Value::Sequence(s) => s.iter().collect(),
+                other => std::iter::once(other).collect(),
+            };
+            for e in entries {
+                if let Some(at) = e.get("at").and_then(|x| x.as_str()) {
+                    if !is_iso8601(at) {
+                        errors += 1;
+                        println!("  ✗ {} — verified.at `{at}` is not ISO 8601 UTC (§5)", rel.display());
+                    }
+                }
+            }
+        }
+        // 正文 markdown 链接可解析性（§6.1；断链记 warning 不记 error）
+        let doc_dir = p.parent().unwrap_or(root);
+        for link in extract_md_links(&body) {
+            if is_external_link(&link) {
+                continue;
+            }
+            let target = resolve_link(root, doc_dir, &link);
+            if !target.exists() {
+                warnings += 1;
+                println!("  ⚠ {} — link `{link}` does not resolve in bundle (§6.1)", rel.display());
+            }
+        }
+    }
+    Ok((files.len(), errors, warnings))
+}
+
+/// ISO 8601 基本格式检查：YYYY-MM-DDTHH:MM:SSZ（或带偏移 +HH:MM）
+fn is_iso8601(s: &str) -> bool {
+    let b = s.as_bytes();
+    if b.len() < 20 {
+        return false;
+    }
+    let digit = |i: usize| b.get(i).map_or(false, |c| c.is_ascii_digit());
+    digit(0) && digit(1) && digit(2) && digit(3)
+        && b.get(4) == Some(&b'-')
+        && digit(5) && digit(6)
+        && b.get(7) == Some(&b'-')
+        && digit(8) && digit(9)
+        && b.get(10) == Some(&b'T')
+        && digit(11) && digit(12)
+        && b.get(13) == Some(&b':')
+        && digit(14) && digit(15)
+        && b.get(16) == Some(&b':')
+        && digit(17) && digit(18)
+        && (b.get(19) == Some(&b'Z') || (b.get(19) == Some(&b'+') || b.get(19) == Some(&b'-')))
+}
+
+fn check_iso_field(fm: &serde_yaml::Value, key: &str, rel: &Path, errors: &mut usize) {
+    if let Some(v) = fm.get(key).and_then(|x| x.as_str()) {
+        if !is_iso8601(v) {
+            *errors += 1;
+            println!("  ✗ {} — {key} `{v}` is not ISO 8601 UTC (§5)", rel.display());
+        }
+    }
+}
+
+/// 提取 markdown 链接目标（`[text](target)`）
+fn extract_md_links(body: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let bytes = body.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'[' {
+            // 找匹配的 ]
+            if let Some(close) = body[i + 1..].find(']') {
+                let after = i + 1 + close + 1;
+                if bytes.get(after) == Some(&b'(') {
+                    if let Some(paren_end) = body[after + 1..].find(')') {
+                        let target = &body[after + 1..after + 1 + paren_end];
+                        // 忽略带 title 形式 [t](url "title") 与空目标
+                        let target = target.split(' ').next().unwrap_or(target);
+                        if !target.is_empty() {
+                            out.push(target.to_string());
+                        }
+                        i = after + 1 + paren_end + 1;
+                        continue;
+                    }
+                }
+            }
+        }
+        i += 1;
+    }
+    out
+}
+
+fn is_external_link(link: &str) -> bool {
+    link.starts_with("http://")
+        || link.starts_with("https://")
+        || link.starts_with('#')
+        || link.starts_with("mailto:")
+        || link.starts_with("data:")
+}
+
+/// 解析链接到 bundle 内绝对路径：/ 开头=bundle 根相对；否则相对文档所在目录
+fn resolve_link(root: &Path, doc_dir: &Path, link: &str) -> PathBuf {
+    if let Some(p) = link.strip_prefix('/') {
+        root.join(p)
+    } else {
+        doc_dir.join(link)
+    }
+}
+
 // ─────────────────────────── 知识库管理（libs） ───────────────────────────
 
 /// `yggd okf libs new <name> [--title X] [--description D]`
@@ -452,15 +616,24 @@ fn cmd_lib_rm(args: &[String]) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// `yggd okf libs validate <name>`
+/// `yggd okf libs validate <name> [--lint]`
 fn cmd_lib_validate(args: &[String]) -> anyhow::Result<()> {
     let (root, opts) = parse_args(args, 5);
-    let name = need(&opts, "path", "usage: yggd okf libs validate <name>")?;
+    let name = need(&opts, "path", "usage: yggd okf libs validate <name> [--lint]")?;
     let dir = lib_dir(&root, &name);
-    let (total, errors) = validate_bundle(&dir)?;
-    println!("okf: validated library `{name}` — {total} document(s), {errors} error(s)");
-    if errors > 0 {
-        std::process::exit(1);
+    let lint = args.iter().any(|a| a == "--lint");
+    if lint {
+        let (total, errors, warnings) = validate_bundle_lint(&dir)?;
+        println!("okf: linted library `{name}` — {total} document(s), {errors} error(s), {warnings} warning(s)");
+        if errors > 0 {
+            std::process::exit(1);
+        }
+    } else {
+        let (total, errors) = validate_bundle(&dir)?;
+        println!("okf: validated library `{name}` — {total} document(s), {errors} error(s)");
+        if errors > 0 {
+            std::process::exit(1);
+        }
     }
     Ok(())
 }
@@ -533,7 +706,7 @@ fn cmd_add(args: &[String]) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// `yggd okf <lib> rm <rel-path>`
+/// `yggd okf <lib> rm <rel-path>` — 移入库内 .trash/ 回收站（可 restore），log.md 记 **Deprecation**
 fn cmd_rm(args: &[String]) -> anyhow::Result<()> {
     let (dir, opts) = resolve_lib(args)?;
     let rel = need(&opts, "path", "usage: yggd okf <lib> rm <rel-path>")?;
@@ -544,45 +717,80 @@ fn cmd_rm(args: &[String]) -> anyhow::Result<()> {
     if !target.exists() {
         anyhow::bail!("concept not found: {}", target.display());
     }
-    std::fs::remove_file(&target)?;
+    let trash = dir.join(".trash").join(&rel);
+    if let Some(parent) = trash.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::rename(&target, &trash)?;
     append_log(&dir, &format!("**Deprecation**: Removed [{}](/{})", rel, rel.replace('\\', "/")))?;
-    println!("okf: concept removed {rel}");
+    println!("okf: concept moved to trash {rel} (restore with `okf <lib> restore {rel}`)");
     Ok(())
 }
 
-/// `yggd okf <lib> edit <rel-path> [--type T] [--title X] [--description D] [--tags a,b] [--status S]`
-/// 保留未知 frontmatter 字段（§4.1），更新 generated.at（§5.2）
+/// `yggd okf <lib> restore <rel-path>` — 从 .trash/ 恢复概念
+fn cmd_restore(args: &[String]) -> anyhow::Result<()> {
+    let (dir, opts) = resolve_lib(args)?;
+    let rel = need(&opts, "path", "usage: yggd okf <lib> restore <rel-path>")?;
+    let trash = dir.join(".trash").join(&rel);
+    if !trash.exists() {
+        anyhow::bail!("not in trash: {rel} (path: {})", trash.display());
+    }
+    let target = dir.join(&rel);
+    if target.exists() {
+        anyhow::bail!("target already exists: {}", target.display());
+    }
+    if let Some(parent) = target.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::rename(&trash, &target)?;
+    append_log(&dir, &format!("**Update**: Restored [{}](/{})", rel, rel.replace('\\', "/")))?;
+    println!("okf: concept restored {rel}");
+    Ok(())
+}
+
+/// `yggd okf <lib> edit <rel-path> [--type T] [--title X] [--description D] [--tags a,b] [--status S] [--stale-after ISO]`
+/// 字段级行编辑：只替换/插入目标 key 的行，保留其余 frontmatter 原文（注释、缩进、顺序），
+/// 保留未知字段（§4.1），更新 generated.at 并保留 generated.by（§5.2）。
 fn cmd_edit(args: &[String]) -> anyhow::Result<()> {
     let (dir, opts) = resolve_lib(args)?;
     let rel = need(&opts, "path", "usage: yggd okf <lib> edit <rel-path> [--title X] ...")?;
     let target = dir.join(&rel);
     let raw = std::fs::read_to_string(&target).map_err(|_| anyhow::anyhow!("concept not found: {}", target.display()))?;
-    let (mut fm, body) = parse_doc(&raw).ok_or_else(|| anyhow::anyhow!("not a valid OKF concept: {}", target.display()))?;
+    let (fm, body) = parse_doc(&raw).ok_or_else(|| anyhow::anyhow!("not a valid OKF concept: {}", target.display()))?;
+
+    // 拆出原始 frontmatter 文本（不含首尾 ---）
+    let inner = raw.strip_prefix("---").ok_or_else(|| anyhow::anyhow!("no frontmatter"))?;
+    let fm_raw = inner.split("\n---").next().ok_or_else(|| anyhow::anyhow!("no closing ---"))?;
+    let fm_raw = fm_raw.trim_start_matches('\n');
+    let mut lines: Vec<String> = fm_raw.lines().map(|l| l.to_string()).collect();
+
+    // 待写入的字段变更：(key, value 文本)
+    let mut changes: Vec<(&str, String)> = Vec::new();
 
     if let Some(t) = opts.get("type") {
         if !t.is_empty() {
-            set_fm(&mut fm, "type", serde_yaml::Value::String(t.clone()));
+            changes.push(("type", t.clone()));
         }
     }
     if let Some(t) = opts.get("title") {
         if !t.is_empty() {
-            set_fm(&mut fm, "title", serde_yaml::Value::String(t.clone()));
+            changes.push(("title", t.clone()));
         }
     }
     if let Some(d) = opts.get("description") {
         if !d.is_empty() {
-            set_fm(&mut fm, "description", serde_yaml::Value::String(d.clone()));
+            changes.push(("description", d.clone()));
         }
     }
     if let Some(r) = opts.get("resource") {
         if !r.is_empty() {
-            set_fm(&mut fm, "resource", serde_yaml::Value::String(r.clone())); // §4.1
+            changes.push(("resource", r.clone()));
         }
     }
     if let Some(t) = opts.get("tags") {
         if !t.is_empty() {
             let list: Vec<String> = t.split(',').map(|x| x.trim().to_string()).filter(|x| !x.is_empty()).collect();
-            set_fm(&mut fm, "tags", serde_yaml::Value::Sequence(list.into_iter().map(serde_yaml::Value::String).collect()));
+            changes.push(("tags", format!("[{}]", list.join(", "))));
         }
     }
     if let Some(s) = opts.get("status") {
@@ -590,29 +798,36 @@ fn cmd_edit(args: &[String]) -> anyhow::Result<()> {
             if !["draft", "stable", "deprecated"].contains(&s.as_str()) {
                 anyhow::bail!("invalid status `{s}` (draft | stable | deprecated, §5.4)");
             }
-            set_fm(&mut fm, "status", serde_yaml::Value::String(s.clone()));
+            changes.push(("status", s.clone()));
         }
     }
     if let Some(st) = opts.get("stale-after") {
         if !st.is_empty() {
-            set_fm(&mut fm, "stale_after", serde_yaml::Value::String(st.clone())); // §5.5 绝对时刻
+            changes.push(("stale_after", st.clone()));
         }
     }
-    // 内容变更 → 更新 generated.at（保留 generated.by）
-    let gen = serde_yaml::Value::Mapping({
-        let mut m = serde_yaml::Mapping::new();
-        if let Some(g) = fm.get("generated") {
-            if let Some(by) = g.get("by") {
-                m.insert(serde_yaml::Value::String("by".into()), by.clone());
-            }
-        }
-        m.insert(serde_yaml::Value::String("at".into()), serde_yaml::Value::String(iso_now()));
-        m
-    });
-    set_fm(&mut fm, "generated", gen);
+    // generated.at 更新（保留 generated.by）——整行替换为内联格式
+    let by = fm
+        .get("generated")
+        .and_then(|g| g.get("by"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("process:nsmt");
+    changes.push(("generated", format!("{{ by: {by}, at: {} }}", iso_now())));
 
-    let fm_yaml = serde_yaml::to_string(&fm).map_err(|e| anyhow::anyhow!("yaml serialize: {e}"))?;
-    std::fs::write(&target, format!("---\n{fm_yaml}---\n\n{body}"))?;
+    for (key, val) in &changes {
+        let prefix = format!("{key}:");
+        if let Some(idx) = lines.iter().position(|l| l.trim_start().starts_with(&prefix)) {
+            // 保留行首缩进与行尾注释（# ...）
+            let line = &lines[idx];
+            let indent: String = line.chars().take_while(|c| c.is_whitespace()).collect();
+            let comment = line.split_once('#').map(|(_, c)| format!("#{c}")).unwrap_or_default();
+            lines[idx] = format!("{indent}{prefix} {val}{}", comment.trim_end());
+        } else {
+            lines.push(format!("{key}: {val}"));
+        }
+    }
+
+    std::fs::write(&target, format!("---\n{}\n---\n\n{}", lines.join("\n"), body))?;
     append_log(&dir, &format!("**Update**: Edited [{}](/{})", rel, rel.replace('\\', "/")))?;
     println!("okf: concept updated {rel}");
     Ok(())
@@ -691,6 +906,64 @@ fn cmd_log(args: &[String]) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// `yggd okf <lib> search <keyword>` — 在库内全部概念（frontmatter + 正文）做大小写不敏感检索
+fn cmd_search(args: &[String]) -> anyhow::Result<()> {
+    let (dir, opts) = resolve_lib(args)?;
+    let kw = need(&opts, "path", "usage: yggd okf <lib> search <keyword>")?;
+    let kw_l = kw.to_lowercase();
+    let files = collect_md_files(&dir);
+    let mut hits = 0;
+    for rel in &files {
+        let p = dir.join(rel);
+        let Some((fm, body)) = load_concept(&p) else { continue };
+        let ftype = fm_str(&fm, "type").unwrap_or_default();
+        let title = fm_str(&fm, "title").unwrap_or_else(|| rel.display().to_string());
+        let cid = rel.with_extension("").display().to_string().replace('\\', "/");
+        // frontmatter 字段命中
+        let mut where_hit: Vec<&str> = Vec::new();
+        if ftype.to_lowercase().contains(&kw_l) {
+            where_hit.push("type");
+        }
+        if title.to_lowercase().contains(&kw_l) {
+            where_hit.push("title");
+        }
+        if let Some(d) = fm_str(&fm, "description") {
+            if d.to_lowercase().contains(&kw_l) {
+                where_hit.push("description");
+            }
+        }
+        if fm_tags(&fm).iter().any(|t| t.to_lowercase().contains(&kw_l)) {
+            where_hit.push("tags");
+        }
+        if !where_hit.is_empty() {
+            hits += 1;
+            println!("{:<16} {cid} [{}]", ftype, where_hit.join(","));
+            println!("{:<16}   {title}", "");
+            continue;
+        }
+        // 正文行命中（输出行号 + 片段）
+        let mut body_lines: Vec<(usize, String)> = Vec::new();
+        for (i, line) in body.lines().enumerate() {
+            if line.to_lowercase().contains(&kw_l) {
+                let t = line.trim();
+                if !t.is_empty() {
+                    body_lines.push((i + 1, t.to_string()));
+                }
+            }
+        }
+        if !body_lines.is_empty() {
+            hits += 1;
+            println!("{:<16} {cid}", ftype);
+            for (ln, text) in body_lines.iter().take(3) {
+                let snippet = if text.len() > 90 { format!("{}…", &text[..90]) } else { text.clone() };
+                println!("{:<16}   L{ln}: {snippet}", "");
+            }
+        }
+    }
+    println!("okf: {hits} concept(s) matched `{kw}` in library");
+    Ok(())
+}
+
 // ─────────────────────────── 分发 ───────────────────────────
 
 /// `yggd okf <libs|lib> <sub> ...`
@@ -722,11 +995,13 @@ pub fn run(args: &[String]) -> anyhow::Result<()> {
             match sub {
                 "add" => cmd_add(args),
                 "rm" => cmd_rm(args),
+                "restore" => cmd_restore(args),
                 "edit" => cmd_edit(args),
                 "list" => cmd_list(args),
                 "show" => cmd_show(args),
                 "index" => cmd_index(args),
                 "log" => cmd_log(args),
+                "search" => cmd_search(args),
                 "help" | "--help" | "-h" => {
                     println!("{}", USAGE);
                     Ok(())
@@ -751,14 +1026,18 @@ Library management:
   yggd okf libs list                                         List libraries
   yggd okf libs show <name>                                  Library details (concepts by type, log)
   yggd okf libs rm <name> --force                            Remove a library
-  yggd okf libs validate <name>                              Check OKF conformance (§11)
+  yggd okf libs validate <name> [--lint]                     Check OKF conformance (§11); --lint adds
+                                                             status enum / ISO time / reserved-file /
+                                                             link-resolution checks (okft-equivalent)
 
 Concept CRUD inside a library:
   yggd okf <lib> add <rel-path> --type T [--title X] [--description D] [--resource URI] [--tags a,b] [--status draft|stable|deprecated]
-  yggd okf <lib> rm <rel-path>
+  yggd okf <lib> rm <rel-path>                Move to .trash/ (recoverable)
+  yggd okf <lib> restore <rel-path>           Restore from .trash/
   yggd okf <lib> edit <rel-path> [--type T] [--title X] [--description D] [--resource URI] [--tags a,b] [--status S] [--stale-after ISO8601]
   yggd okf <lib> list [--type T]
   yggd okf <lib> show <rel-path>
+  yggd okf <lib> search <keyword>             Full-text search across frontmatter + body
   yggd okf <lib> index                       Refresh index.md per directory (§8)
   yggd okf <lib> log <message>               Append log.md entry (§9)
 
@@ -766,3 +1045,127 @@ OKF v0.2 rules enforced: type required (§4.1); reserved filenames index.md/log.
 (§3.1); concept id = path minus .md (§2); generated.by actor process:nsmt (§7);
 index.md carries no frontmatter, per-directory links are relative (§8); unknown
 frontmatter keys preserved on edit (§4.1); removal records **Deprecation** in log.md (§9)."#;
+
+// ─────────────────────────── 单元测试 ───────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ---- parse_doc ----
+    #[test]
+    fn parse_doc_parses_frontmatter_and_body() {
+        let doc = "---\ntype: Metric\ntitle: R2\n---\n\n# R2\n\nbody text\n";
+        let (fm, body) = parse_doc(doc).expect("parse");
+        assert_eq!(fm_str(&fm, "type").unwrap(), "Metric");
+        assert_eq!(fm_str(&fm, "title").unwrap(), "R2");
+        assert!(body.contains("# R2"));
+        assert!(body.contains("body text"));
+    }
+
+    #[test]
+    fn parse_doc_tolerates_bom() {
+        let doc = "\u{feff}---\ntype: Reference\n---\n\n# X\n";
+        let (fm, _) = parse_doc(doc).expect("parse with BOM");
+        assert_eq!(fm_str(&fm, "type").unwrap(), "Reference");
+    }
+
+    #[test]
+    fn parse_doc_handles_inline_generated() {
+        let doc = "---\ntype: Metric\ngenerated: { by: process:nsmt, at: 2026-08-31T06:00:00Z }\n---\n\nbody\n";
+        let (fm, _) = parse_doc(doc).expect("parse");
+        let g = fm.get("generated").expect("generated present");
+        assert_eq!(g.get("by").and_then(|v| v.as_str()).unwrap(), "process:nsmt");
+        assert_eq!(g.get("at").and_then(|v| v.as_str()).unwrap(), "2026-08-31T06:00:00Z");
+    }
+
+    #[test]
+    fn parse_doc_none_when_no_frontmatter() {
+        assert!(parse_doc("# no frontmatter\n").is_none());
+        assert!(parse_doc("").is_none());
+        assert!(parse_doc("---\nnot: [valid: yaml\n---\n").is_none());
+    }
+
+    #[test]
+    fn parse_doc_keeps_tags_sequence_and_inline() {
+        let seq = "---\ntype: X\ntags:\n- a\n- b\n---\n\nbody\n";
+        let (fm, _) = parse_doc(seq).expect("parse");
+        assert_eq!(fm_tags(&fm), vec!["a".to_string(), "b".to_string()]);
+        let inline = "---\ntype: X\ntags: [a, b]\n---\n\nbody\n";
+        let (fm, _) = parse_doc(inline).expect("parse");
+        assert_eq!(fm_tags(&fm), vec!["a".to_string(), "b".to_string()]);
+        let csv = "---\ntype: X\ntags: a, b\n---\n\nbody\n";
+        let (fm, _) = parse_doc(csv).expect("parse");
+        assert_eq!(fm_tags(&fm), vec!["a".to_string(), "b".to_string()]);
+    }
+
+    // ---- civil_from_days / iso_now ----
+    #[test]
+    fn civil_from_days_epoch() {
+        assert_eq!(civil_from_days(0), (1970, 1, 1));
+    }
+
+    #[test]
+    fn civil_from_days_known_dates() {
+        // 2026-08-31 = 20696 days since epoch
+        assert_eq!(civil_from_days(20696), (2026, 8, 31));
+        assert_eq!(civil_from_days(20235), (2025, 5, 27));
+        assert_eq!(civil_from_days(19723), (2024, 1, 1));
+    }
+
+    #[test]
+    fn iso_now_format() {
+        let s = iso_now();
+        // YYYY-MM-DDTHH:MM:SSZ
+        assert_eq!(s.len(), 20);
+        assert!(s.ends_with('Z'));
+        assert_eq!(&s[4..5], "-");
+        assert_eq!(&s[7..8], "-");
+        assert_eq!(&s[10..11], "T");
+        assert_eq!(&s[13..14], ":");
+        assert_eq!(&s[16..17], ":");
+        // year within reasonable range
+        let year: u32 = s[..4].parse().unwrap();
+        assert!((2024..=2030).contains(&year));
+    }
+
+    // ---- valid_lib_name ----
+    #[test]
+    fn lib_name_validation() {
+        assert!(valid_lib_name("epdheat"));
+        assert!(valid_lib_name("heating-analysis"));
+        assert!(valid_lib_name("a.b_c-1"));
+        assert!(!valid_lib_name(""));
+        assert!(!valid_lib_name("Upper"));
+        assert!(!valid_lib_name("has space"));
+        assert!(!valid_lib_name("../../etc"));
+        assert!(!valid_lib_name(&"x".repeat(64)));
+    }
+
+    // ---- reserved filenames ----
+    #[test]
+    fn reserved_names_exact() {
+        assert_eq!(RESERVED, ["index.md", "log.md"]);
+    }
+
+    // ---- concept id semantics（§2：路径去 .md）----
+    #[test]
+    fn concept_id_is_path_minus_md() {
+        let rel = PathBuf::from("tables/orders.md");
+        let cid = rel.with_extension("").display().to_string().replace('\\', "/");
+        assert_eq!(cid, "tables/orders");
+    }
+
+    // ---- load_concept round-trip ----
+    #[test]
+    fn load_concept_round_trip() {
+        let dir = std::env::temp_dir().join("nsmt-okf-test-roundtrip");
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("c.md");
+        std::fs::write(&p, "---\ntype: Metric\ntitle: R2\nstatus: stable\n---\n\n# R2\n").unwrap();
+        let (fm, body) = load_concept(&p).expect("load");
+        assert_eq!(fm_str(&fm, "status").unwrap(), "stable");
+        assert!(body.contains("# R2"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+}
