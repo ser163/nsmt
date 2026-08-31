@@ -205,7 +205,7 @@ async fn wait_child(state: &AdminState) -> Option<i32> {
     }
 }
 
-/// 终止子进程（SIGTERM → 等待 → SIGKILL）。
+/// 终止子进程（Unix: SIGTERM → 等待 → SIGKILL；Windows: taskkill /T /F）。
 fn terminate(pid: u32) {
     #[cfg(unix)]
     {
@@ -217,6 +217,12 @@ fn terminate(pid: u32) {
             }
         }
         let _ = std::process::Command::new("kill").arg("-KILL").arg(pid.to_string()).status();
+    }
+    #[cfg(windows)]
+    {
+        let _ = std::process::Command::new("taskkill")
+            .args(["/PID", &pid.to_string(), "/T", "/F"])
+            .status();
     }
 }
 

@@ -122,6 +122,19 @@ pub fn ensure_object_local(blob_id: &str, bytes: &[u8]) -> std::io::Result<()> {
     Ok(())
 }
 
+/// 跨平台创建符号链接（NSMT_SYMLINK_VIEW=1 时物化共享文件）。
+/// Windows 上创建文件符号链接需要开发者模式或管理员权限；失败时调用方会收到 io 错误。
+#[cfg(unix)]
+fn make_symlink(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result<()> {
+    std::os::unix::fs::symlink(src, dst)
+}
+
+#[cfg(windows)]
+fn make_symlink(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result<()> {
+    // 目标是 CAS 对象文件（blob），用文件符号链接
+    std::os::windows::fs::symlink_file(src, dst)
+}
+
 /// 物化一个对象到共享目录（决策 #4：默认真实文件；NSMT_SYMLINK_VIEW=1 用 symlink）。
 pub fn materialize(entry: &FileTreeEntry, bytes: &[u8]) -> std::io::Result<()> {
     let dir = share_dir();
@@ -136,7 +149,7 @@ pub fn materialize(entry: &FileTreeEntry, bytes: &[u8]) -> std::io::Result<()> {
             std::fs::write(&obj, bytes)?;
         }
         let _ = std::fs::remove_file(&target);
-        std::os::unix::fs::symlink(&obj, &target)?;
+        make_symlink(&obj, &target)?;
     } else {
         let mut f = std::fs::File::create(&target)?;
         f.write_all(bytes)?;
